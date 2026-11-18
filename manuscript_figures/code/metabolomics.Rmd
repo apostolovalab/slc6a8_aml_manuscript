@@ -1,0 +1,735 @@
+---
+title: "Manuscript figures — Metabolomics chemotherapy"
+subtitle: "Creatine Manuscript"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+# Setup
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(UpSetR)
+library(VennDiagram)
+library(ggVennDiagram)
+library(grid)
+library(gridExtra)
+library(writexl)
+
+params <- list(
+  data_dir     = "../data/metabolomics_chemotherapy_creatine/data/raw",
+  helpers_file = "helpers.R",
+  fig_dir      = "../results/figures/metabolomics"
+)
+
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+out_dir_fig <- params$fig_dir
+dir.create(out_dir_fig, recursive = TRUE, showWarnings = FALSE)
+
+cs <- list(
+  SampleGroup = setNames(
+    c("#CFCDCD", "#F693C5", "#9DC3E3", "#7FC5A2"),
+    c("VEH", "CYT", "DAU", "AZA")
+  )
+)
+```
+
+```{r}
+save_and_show <- function(file, width, height, plot_fun) {
+  pdf(file, width = width, height = height)
+  plot_fun()
+  invisible(dev.off())
+  plot_fun()
+}
+
+n_per_group_txt <- function(mat) {
+  grp <- sub("^[^_]+_", "", unlist(attr(mat, "group")))
+  n   <- table(factor(grp, levels = unique(grp)))
+  if (length(unique(n)) == 1) {
+    paste0("n = ", n[[1]], " per group")
+  } else {
+    paste(names(n), "n =", n, collapse = ", ")
+  }
+}
+```
+
+# Data & statistics
+
+## Load targeted LC-MS data
+
+```{r}
+list.files(params$data_dir)
+dat_files <- c(
+  "Model 1 - RMB-1 drugs"          = "Model 1-targeted_EXP 02.387 LC-MS RMB-1 with drugs targeted.csv",
+  "Model 2 - HL-60 drugs"          = "Model 2-targeted_EXP 02.385 LC-MS HL-60 with drugs targeted.csv",
+  "Model 4 - MLL-PTD FLT3-ITD AZA" = "Model 4-targeted_EXP 02.201 LC-MS Mll-PDT Flt3-ITD BM with aza targeted.csv"
+)
+
+load_targeted <- function(file) {
+  raw <- read_csv(file, col_types = cols(.default = col_character()),
+                  name_repair = "minimal") |>
+    as.data.frame()
+  mat <- apply(raw[-1, -1], 2, as.numeric)
+  rownames(mat) <- raw[-1, 1]
+  attr(mat, "group") <- raw[1, -1]
+  mat
+}
+
+dat_target <- lapply(file.path(params$data_dir, dat_files), load_targeted)
+names(dat_target) <- names(dat_files)
+
+dat_target <- lapply(dat_target, function(m) {
+  rownames(m)[rownames(m) == "Uridine diphosphate-N-acetylglucosamine"] <- "UDP-GlcNAc"
+  m
+})
+
+model_names <- names(dat_target)
+plot_titles <- c("RMB-1", "HL-60", "AML-MLL-PTD FLT3-ITD")
+
+model_desc <- c(
+  "RMB-1 cells treated for 24 h with vehicle (VEH), cytarabine (CYT), daunorubicin (DAU) or azacytidine (AZA)",
+  "HL-60 cells treated for 24 h with vehicle (VEH), cytarabine (CYT), daunorubicin (DAU) or azacytidine (AZA)",
+  "bone marrow of Mll-PTD/Flt3-ITD AML mice treated with vehicle (VEH) or azacytidine (AZA) from day 14 to day 18 and harvested on day 23"
+)
+```
+
+## Differential tests
+
+```{r}
+run_anova_tukey <- function(mat) {
+  groups <- as.factor(unlist(attr(mat, "group")))
+
+  res <- apply(mat, 1, function(vals) {
+    df <- data.frame(value = as.numeric(vals), group = groups)
+    df <- df[!is.na(df$value), ]
+
+    if (length(unique(df$group)) < 2) {
+      return(list(F_value = NA, p_value = NA, df_between = NA, df_within = NA,
+                  n_sig_vs_VEH = NA, sig_vs_VEH = NA))
+    }
+
+    fit <- aov(value ~ group, data = df)
+    s   <- summary(fit)[[1]]
+
+    tukey      <- TukeyHSD(fit)$group
+    veh_rows   <- tukey[grepl("A_VEH", rownames(tukey)), , drop = FALSE]
+    sig_mask   <- veh_rows[, "p adj"] < 0.05 & !is.na(veh_rows[, "p adj"])
+    sig_groups <- gsub("^-|-$", "", gsub("A_VEH", "", rownames(veh_rows)[sig_mask]))
+
+    list(
+      F_value      = round(s["group", "F value"], 4),
+      p_value      = s["group", "Pr(>F)"],
+      df_between   = s["group", "Df"],
+      df_within    = s["Residuals", "Df"],
+      n_sig_vs_VEH = sum(sig_mask),
+      sig_vs_VEH   = paste(sig_groups, collapse = ";")
+    )
+  })
+
+  out <- bind_rows(lapply(res, as.data.frame), .id = "metabolite") |>
+    mutate(p_adjusted = p.adjust(p_value, method = "BH")) |>
+    select(metabolite, df_between, df_within, F_value, p_value, p_adjusted,
+           n_sig_vs_VEH, sig_vs_VEH) |>
+    arrange(p_adjusted) |>
+    mutate(p_value = signif(p_value, 4), p_adjusted = signif(p_adjusted, 4))
+  rownames(out) <- out$metabolite
+  out
+}
+
+run_welch_ttest <- function(mat) {
+  groups <- as.factor(unlist(attr(mat, "group")))
+  lv     <- levels(groups)
+
+  res <- apply(mat, 1, function(vals) {
+    v  <- as.numeric(vals)
+    g1 <- v[groups == lv[1] & !is.na(v)]
+    g2 <- v[groups == lv[2] & !is.na(v)]
+
+    if (length(g1) < 2 || length(g2) < 2) return(rep(NA_real_, 5))
+
+    tt <- t.test(g1, g2, var.equal = FALSE)
+    c(round(mean(g1), 2), round(mean(g2), 2),
+      round(unname(tt$statistic), 4), round(unname(tt$parameter), 2), tt$p.value)
+  })
+
+  out <- as.data.frame(t(res))
+  colnames(out) <- c("mean_A_VEH", "mean_B_AZA", "t_value", "df", "p_value")
+  out <- out |>
+    mutate(metabolite = rownames(out),
+           p_adjusted = p.adjust(p_value, method = "BH")) |>
+    select(metabolite, mean_A_VEH, mean_B_AZA, t_value, df, p_value, p_adjusted) |>
+    arrange(p_adjusted) |>
+    mutate(p_value = signif(p_value, 4), p_adjusted = signif(p_adjusted, 4))
+  rownames(out) <- out$metabolite
+  out
+}
+
+res_diff <- list(
+  run_anova_tukey(dat_target[[1]]),
+  run_anova_tukey(dat_target[[2]]),
+  run_welch_ttest(dat_target[[3]])
+)
+names(res_diff) <- model_names
+```
+
+## Combined table and hit sets
+
+```{r}
+fisher_p <- function(p) {
+  p <- p[!is.na(p)]
+  if (length(p) == 0) return(NA_real_)
+  pchisq(-2 * sum(log(p)), df = 2 * length(p), lower.tail = FALSE)
+}
+
+combined <- res_diff[[1]] |>
+  select(metabolite, p_m1 = p_value, padj_m1 = p_adjusted,
+         n_sig_vs_VEH_m1 = n_sig_vs_VEH, sig_vs_VEH_m1 = sig_vs_VEH) |>
+  full_join(res_diff[[2]] |>
+              select(metabolite, p_m2 = p_value, padj_m2 = p_adjusted,
+                     n_sig_vs_VEH_m2 = n_sig_vs_VEH, sig_vs_VEH_m2 = sig_vs_VEH),
+            by = "metabolite") |>
+  full_join(res_diff[[3]] |>
+              select(metabolite, p_m4 = p_value, padj_m4 = p_adjusted),
+            by = "metabolite")
+
+combined$p_fisher <- apply(combined[, c("p_m1", "p_m2", "p_m4")], 1, fisher_p)
+
+combined <- combined |>
+  mutate(p_fisher_adj = p.adjust(p_fisher, method = "BH"),
+         n_sig        = rowSums(cbind(padj_m1, padj_m2, padj_m4) < 0.05, na.rm = TRUE)) |>
+  arrange(p_fisher_adj)
+
+core_hits <- combined |>
+  filter(n_sig == 3, n_sig_vs_VEH_m1 == 3, n_sig_vs_VEH_m2 == 3) |>
+  pull(metabolite)
+
+any_hits <- list(
+  combined$metabolite[which(combined$n_sig_vs_VEH_m1 == 3)],
+  combined$metabolite[which(combined$n_sig_vs_VEH_m2 == 3)],
+  combined$metabolite[which(combined$padj_m4 < 0.05)]
+)
+names(any_hits) <- model_names
+
+alpha <- 0.05
+sig_list <- list(
+  "RMB-1"            = combined$metabolite[which(combined$padj_m1 < alpha & combined$n_sig_vs_VEH_m1 == 3)],
+  "HL-60"            = combined$metabolite[which(combined$padj_m2 < alpha & combined$n_sig_vs_VEH_m2 == 3)],
+  "Mll-PTD Flt3-ITD" = combined$metabolite[which(combined$padj_m4 < alpha)]
+)
+
+make_group_sets <- function(df, col) {
+  df_sub     <- df[!is.na(df[[col]]) & nzchar(trimws(df[[col]])), ]
+  all_groups <- sort(unique(trimws(unlist(strsplit(df_sub[[col]], ";")))))
+  all_groups <- all_groups[nzchar(all_groups)]
+
+  setNames(
+    lapply(all_groups, function(g) {
+      df_sub$metabolite[
+        vapply(strsplit(df_sub[[col]], ";"), function(x) g %in% trimws(x), logical(1))
+      ]
+    }),
+    all_groups
+  )
+}
+
+venn2_list <- make_group_sets(combined, "sig_vs_VEH_m1")
+names(venn2_list) <- gsub("._", "", names(venn2_list))
+venn3_list <- make_group_sets(combined, "sig_vs_VEH_m2")
+names(venn3_list) <- gsub("._", "", names(venn3_list))
+sig_m4 <- sort(combined$metabolite[!is.na(combined$padj_m4) & combined$padj_m4 < 0.05])
+```
+
+```{r}
+core_def <- paste0(
+  "core metabolites significantly altered in all three models (BH-adjusted p < 0.05 ",
+  "in each model; for RMB-1 and HL-60, all three treatments differing from VEH by ",
+  "Tukey's HSD, p < 0.05)"
+)
+tests_def <- paste0(
+  "one-way ANOVA followed by Tukey's HSD (RMB-1, HL-60) or Welch's t-test ",
+  "(Mll-PTD/Flt3-ITD), with Benjamini-Hochberg (BH) correction across metabolites"
+)
+```
+
+# Main figures
+
+## Result heatmaps {.tabset}
+
+```{r}
+draw_main_heatmap <- function(i, file, width, height) {
+  ht <- make_heatmap_metab(model_names[i], dat_target, core_hits, any_hits)
+  save_and_show(file, width, height, function() {
+    draw(ht,
+         heatmap_legend_side    = "right",
+         annotation_legend_side = "right",
+         merge_legends          = TRUE)
+  })
+}
+```
+
+### Model 1 - RMB-1
+
+```{r fig.height=5, fig.width=4}
+f <- file.path(out_dir_fig, "Heatmap_top_metab_Model1RMB1.pdf")
+draw_main_heatmap(1, f, width = 4, height = 5)
+```
+
+### Model 2 - HL-60
+
+```{r fig.height=3, fig.width=4}
+f <- file.path(out_dir_fig, "Heatmap_top_metab_Model2HL60.pdf")
+draw_main_heatmap(2, f, width = 4, height = 3)
+```
+
+### Model 4 - MLL-PTD FLT3-ITD
+
+```{r fig.height=6.5, fig.width=4}
+f <- file.path(out_dir_fig, "Heatmap_top_metab_Model3AML-MLL-PTD-FLT3-ITD.pdf")
+draw_main_heatmap(3, f, width = 4, height = 6)
+```
+
+## UpSet plot - significant hits per model
+
+```{r}
+plot_upset_hits <- function(sets_list, keep_order = FALSE,
+                            text_scale = c(1.6, 2, 1.43, 2.2, 2.2, 2.2),
+                            point_size = 5, line_size = 1.5) {
+  full_int <- Reduce(intersect, sets_list)
+  qry <- if (length(full_int) > 0) {
+    list(list(query = intersects, params = list(names(sets_list)),
+              color = "darkorange", active = TRUE))
+  } else {
+    NULL
+  }
+
+  upset(fromList(sets_list),
+        nsets           = length(sets_list),
+        sets            = names(sets_list),
+        keep.order      = keep_order,
+        nintersects     = NA,
+        mb.ratio        = c(0.75, 0.25),
+        order.by        = "freq",
+        mainbar.y.label = "Intersection Size",
+        sets.x.label    = "# Altered Metabolites",
+        text.scale      = text_scale,
+        point.size      = point_size,
+        line.size       = line_size,
+        set_size.show   = FALSE,
+        main.bar.color  = "black", matrix.color = "black", sets.bar.color = "black",
+        queries         = qry)
+}
+```
+
+```{r fig.width=6, fig.height=4.9}
+f <- file.path(out_dir_fig, "Upset_significant_hits.pdf")
+p_up <- plot_upset_hits(sig_list)
+save_and_show(f, width = 6, height = 4.9, function() print(p_up))
+```
+
+## Venn diagrams - combined
+
+```{r}
+g1 <- grid.grabExpr({
+  pushViewport(viewport(y = 0.46, height = 0.85, just = "center"))
+  draw.single.venn(
+    area = length(sig_m4), category = "MLL-PTD FLT3-ITD",
+    label.col = "black", lwd = 2, fill = "#D6604D", alpha = 0.5,
+    fontface = "plain", fontfamily = "sans",
+    cat.fontface = "bold", cat.fontfamily = "sans",
+    cex = 2, cat.cex = 1.3, cat.pos = 0, cat.dist = 0.055
+  )
+  popViewport()
+})
+
+g4 <- grid.grabExpr({
+  draw.single.venn(
+    area = length(core_hits), category = "Common hits",
+    label.col = "black", lwd = 2, fill = "darkorange", alpha = 0.5,
+    fontface = "plain", fontfamily = "sans",
+    cat.fontface = "bold", cat.fontfamily = "sans",
+    cex = 0, cat.cex = 1.3, cat.pos = 0, cat.dist = 0.05
+  )
+  grid.text(label = paste(core_hits, collapse = "\n"), x = 0.5, y = 0.5,
+            gp = gpar(fontsize = 16, lineheight = 1.5))
+})
+
+make_treat_venn <- function(sets, title) {
+  ggVennDiagram(sets, label = "count", label_alpha = 0,
+                set_color = "black", edge_lty = "solid") +
+    scale_fill_gradient(low = "white", high = "#D6604D") +
+    labs(title = title, fill = "Count") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "none")
+}
+
+p2 <- make_treat_venn(venn2_list, "RMB-1") +
+  scale_x_continuous(expand = expansion(mult = .1)) +
+  scale_y_continuous(expand = expansion(mult = .1))
+p3 <- make_treat_venn(venn3_list, "HL-60")
+
+gp2 <- ggplotGrob(p2)
+gp3 <- ggplotGrob(p3)
+
+layout_mat <- rbind(
+  c(1,  NA,  2),
+  c(NA,  4, NA),
+  c(NA,  3, NA)
+)
+```
+
+```{r fig.height=6, fig.width=8}
+f <- file.path(out_dir_fig, "VennDiagrams_combined.pdf")
+save_and_show(f, width = 8, height = 6, function() {
+  grid.arrange(g1, gp2, gp3, g4,
+               layout_matrix = layout_mat,
+               widths  = c(1.5, 1.6, 1.6),
+               heights = c(1.5, 1, 1.6))
+})
+```
+
+## UpSet plot - equivalent of the combined Venn
+
+```{r fig.width=8, fig.height=6.8}
+tag_sets <- function(sets, model, common) {
+  setNames(
+    lapply(sets, function(x) ifelse(x %in% common, x, paste0(model, "::", x))),
+    paste(model, names(sets))
+  )
+}
+
+venn_upset_sets <- c(
+  tag_sets(venn2_list,          "RMB-1",            core_hits),
+  tag_sets(venn3_list,          "HL-60",            core_hits),
+  tag_sets(list(AZA = sig_m4),  "MLL-PTD FLT3-ITD", core_hits)
+)
+
+f <- file.path(out_dir_fig, "Upset_VennDiagrams_combined.pdf")
+p_up_venn <- plot_upset_hits(venn_upset_sets, keep_order = TRUE,
+                             text_scale = c(2, 1.9, 1.8, 1.9, 1.9, 2.4),
+                             point_size = 4, line_size = 1)
+save_and_show(f, width = 8, height = 6.8, function() print(p_up_venn))
+```
+
+# Supplementary figures
+
+## Heatmaps - All metabolites {.tabset}
+
+```{r}
+make_heatmap_stats <- function(mat_name, dat_list, hits_core, hits_any,
+                               plot_title, stat_list) {
+
+  mat_raw  <- dat_list[[mat_name]]
+  grp_raw  <- as.character(attr(mat_raw, "group"))
+  grp      <- sub("^[^_]+_", "", grp_raw)
+
+  all_hits <- unique(c(hits_core, hits_any[[mat_name]]))
+  rows_use <- all_hits[all_hits %in% rownames(mat_raw)]
+
+  mat_sub  <- mat_raw[rows_use, , drop = FALSE]
+  mat_z    <- t(scale(t(as.matrix(mat_sub))))
+
+  row_split    <- factor(ifelse(rows_use %in% hits_core, "Core", "Any"),
+                         levels = c("Core", "Any"))
+  row_fontface <- ifelse(rows_use %in% hits_core, "bold", "plain")
+
+  grp_levels <- unique(grp)
+  grp_cols   <- cs$SampleGroup
+
+  col_anno <- HeatmapAnnotation(
+    Group = anno_block(
+      gp        = gpar(fill = grp_cols[grp_levels], col = NA),
+      labels    = grp_levels,
+      labels_gp = gpar(fontsize = 8, col = "white", fontface = "bold")
+    ),
+    simple_anno_size     = unit(5, "mm"),
+    show_annotation_name = FALSE,
+    show_legend          = FALSE
+  )
+
+  col_fun <- colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#D6604D"))
+
+  stat_df  <- stat_list[[mat_name]]
+  stat_sub <- stat_df[match(rows_use, rownames(stat_df)), , drop = FALSE]
+
+  if ("n_sig_vs_VEH" %in% colnames(stat_df)) {
+    stat_vals  <- stat_sub$n_sig_vs_VEH
+    stat_label <- "N sig.\nvs \nVEH"
+  } else {
+    stat_vals  <- stat_sub$t_value
+    stat_label <- "t value"
+  }
+
+  p_adj <- stat_sub$p_adjusted
+  sig_labels <- ifelse(is.na(p_adj),       "",
+                ifelse(p_adj < 0.0001, "****",
+                ifelse(p_adj < 0.001,  "***",
+                ifelse(p_adj < 0.01,   "**",
+                ifelse(p_adj < 0.05,   "*",
+                                       "ns")))))
+
+  stat_range   <- range(stat_vals, na.rm = TRUE)
+  col_fun_stat <- colorRamp2(
+    c(stat_range[1], mean(stat_range), stat_range[2]),
+    c("#2166AC", "white", "#D6604D")
+  )
+
+  row_anno <- rowAnnotation(
+    stat = anno_simple(
+      stat_vals,
+      col    = col_fun_stat,
+      pch    = sig_labels,
+      pt_gp  = gpar(fontsize = 7, fontface = "bold"),
+      na_col = "grey90"
+    ),
+    annotation_name_gp     = gpar(fontsize = 8),
+    annotation_label       = stat_label,
+    show_annotation_name   = TRUE,
+    annotation_name_side   = "top",
+    annotation_name_rot    = 0,
+    annotation_name_offset = unit(2, "mm")
+  )
+
+  stat_legend <- Legend(col_fun = col_fun_stat, title = stat_label,
+                        direction = "vertical")
+
+  ht <- Heatmap(
+    mat_z,
+    name                  = "Z-score",
+    col                   = col_fun,
+    column_title          = plot_title,
+    column_title_gp       = gpar(fontsize = 10, fontface = "bold"),
+    column_title_side     = "top",
+    top_annotation        = col_anno,
+    right_annotation      = row_anno,
+    column_split          = factor(grp, levels = grp_levels),
+    cluster_column_slices = FALSE,
+    column_gap            = unit(1, "mm"),
+    row_split             = row_split,
+    row_title             = NULL,
+    row_gap               = unit(3, "mm"),
+    show_row_names        = TRUE,
+    row_names_side        = "left",
+    row_names_gp          = gpar(fontsize = 9, fontface = row_fontface),
+    show_row_dend         = FALSE,
+    cluster_rows          = TRUE,
+    cluster_row_slices    = FALSE,
+    cluster_columns       = FALSE,
+    show_column_names     = FALSE,
+    width  = unit(4 * ncol(mat_z), "mm"),
+    height = unit(4 * nrow(mat_z) + 20, "mm")
+  )
+
+  list(ht = ht, stat_legend = stat_legend)
+}
+
+draw_supp_heatmap <- function(i, file, width, height) {
+  res_i    <- res_diff[[i]]
+  in_mat   <- rownames(dat_target[[i]])
+  sig_i    <- in_mat[in_mat %in% res_i$metabolite[res_i$p_adjusted < 0.05]]
+  nonsig_i <- setNames(
+    list(in_mat[in_mat %in% res_i$metabolite[res_i$p_adjusted > 0.05]]),
+    model_names[i]
+  )
+
+  out <- make_heatmap_stats(model_names[i], dat_target, sig_i, nonsig_i,
+                            plot_titles[i], stat_list = res_diff)
+
+  save_and_show(file, width, height, function() {
+    draw(out$ht,
+         heatmap_legend_side    = "right",
+         annotation_legend_side = "right",
+         merge_legends          = TRUE,
+         annotation_legend_list = list(out$stat_legend),
+         padding                = unit(c(2, 2, 2, 2), "mm"))
+  })
+}
+```
+
+### Model 1 - RMB-1
+
+```{r fig.height=16, fig.width=5.5}
+f <- file.path(out_dir_fig, "Heatmap_All_metab_Model1RMB1.pdf")
+draw_supp_heatmap(1, f, width = 5.5, height = 16)
+```
+
+### Model 2 - HL-60
+
+```{r fig.height=13.5, fig.width=5.5}
+f <- file.path(out_dir_fig, "Heatmap_All_metab_Model2HL60.pdf")
+draw_supp_heatmap(2, f, width = 5.5, height = 13.5)
+```
+
+### Model 4 - MLL-PTD FLT3-ITD
+
+```{r fig.height=15.5, fig.width=4.5}
+f <- file.path(out_dir_fig, "Heatmap_All_metab_Model3AML-MLL-PTD-FLT3-ITD.pdf")
+draw_supp_heatmap(3, f, width = 4.5, height = 15.5)
+```
+
+# Untarggeted metabolomics
+
+```{r results='asis', fig.height=4, fig.width=3.5}
+library(data.table)
+library(dplyr)
+library(plyr)
+library(impute)
+dat_files <- list(
+  "Model 1 - RMB-1 drugs" = "../data/metabolomics_chemotherapy_creatine/data/raw/Model 1-untargeted_EXP 02.387 LC-MS RMB-1 with drugs untargeted.csv",
+  "Model 2 - HL-60 drugs" = "../data/metabolomics_chemotherapy_creatine/data/raw/Model 2-untargeted_EXP 02.385 LC-MS HL-60 with drugs untargeted.csv",
+  "Model 3 - RMB-1 AZA" = "../data/metabolomics_chemotherapy_creatine/data/raw/Model 3-untargeted_EXP 02.131 RMB-1 aza-resistant untargeted.csv",
+  "Model 4 - MLL-PTD FLT3-ITD AZA" = "../data/metabolomics_chemotherapy_creatine/data/raw/Model 4-untargetedEXP 02.201 LC-MS Mll-PTD Flt3-ITD BM with aza untargeted.csv"
+)
+dat_imput_type <- list(
+  "knn", "knn", "hm", "hm"
+)
+names(dat_imput_type) <- names(dat_files)
+
+for(DAT_NAM in names(dat_files)){
+
+  ## Loading ----------------------------------------------------------------
+
+  cat("###", DAT_NAM, "\n\n")
+
+  dat_sub <- fread(dat_files[[DAT_NAM]])
+  group_sub <- dat_sub[1, ]
+  group_sub <- gsub(".*_", "", group_sub[1,])[-1]
+  group_sub <- mapvalues(group_sub, c("Cytarabine", "Daunorubicin", "Azacytidine"),
+                         c("CYT", "DAU", "AZA"))
+  dat_sub <- dat_sub[-1,]
+
+  feat_cols <- colnames(dat_sub)[-1]
+  mat <- as.matrix(dat_sub[, ..feat_cols])
+  mat <- apply(mat, 2, as.numeric)
+  rownames(mat) <- dat_sub[[1]]
+
+  na_only <- which(rowSums(is.na(mat))==ncol(mat))
+  if(length(na_only) > 0) mat <- mat[-na_only, ]
+
+  # Imputation ----------------------------------------------------------------
+
+  if(dat_imput_type[[DAT_NAM]] == "knn"){
+    set.seed(42)
+    imputed <- impute.knn(mat, k = 10, rowmax = 0.5, colmax = 0.8)
+    mat_imp  <- imputed$data
+  }
+  if(dat_imput_type[[DAT_NAM]] == "hm"){
+    mat_imp <- t(apply(mat, 1, function(x) {
+      x[is.na(x)] <- min(x, na.rm = TRUE) / 2
+      x
+    }))
+  }
+
+  imp_summary <- rbind(
+    summarise_mat(mat,     "Before Imputation"),
+    summarise_mat(mat_imp, "After Imputation")
+  )
+
+  # Transform + PCA ----------------------------------------------------------------
+  mat_log    <- log2(mat_imp + 1)
+  col_mean   <- colMeans(mat_log)
+  col_sd     <- apply(mat_log, 2, sd)
+  mat_scaled <- scale(mat_log, center = col_mean, scale = sqrt(col_sd))
+
+  pca_res <- prcomp(t(mat_scaled), center = TRUE, scale. = FALSE)
+  pca_var <- round(100 * summary(pca_res)$importance[2, 1:4], 1)
+
+  pca_df <- data.frame(
+    Sample = rownames(pca_res$x),
+    PC1    = pca_res$x[, 1],
+    PC2    = pca_res$x[, 2],
+    PC3    = pca_res$x[, 3]
+  )
+
+  grp_vec <- group_sub
+  grp_df  <- data.frame(Sample = feat_cols,
+                        Group = grp_vec,
+                        stringsAsFactors = FALSE)
+
+  pca_df <- merge(pca_df, grp_df, by = "Sample")
+
+  # Plot --------------------------------------------------------------------------------
+
+  cs_sub <- cs$SampleGroup[names(cs$SampleGroup) %in% grp_df$Group]
+
+  group_counts <- table(pca_df$Group)
+  new_labels   <- paste0(names(group_counts), " (n=", group_counts, ")")
+  names(new_labels) <- names(group_counts)
+
+  group_shapes <- c(21, 22, 23, 24, 25)[seq_along(levels(factor(pca_df$Group)))]
+  names(group_shapes) <- levels(factor(pca_df$Group))
+
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = Group, fill = Group, shape = Group)) +
+
+    geom_point(size = 7, colour = "black", stroke = 1.5) +
+    geom_point(size = 7, alpha = 0.8, stroke = 1.2) +
+
+    scale_colour_manual(values = cs_sub, labels = new_labels) +
+    scale_fill_manual(values   = cs_sub, labels = new_labels) +
+    scale_shape_manual(values  = group_shapes, labels = new_labels) +
+    scale_x_continuous(expand = expansion(add = 3.5)) +
+    scale_y_continuous(expand = expansion(add = 3.5)) +
+    labs(
+      x       = paste0("PC1  (", pca_var[1], "% of variance)"),
+      y       = paste0("PC2  (", pca_var[2], "% of variance)"),
+      colour  = "Group", fill = "Group", shape = "Group"
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = 4, stroke = 1.2)),
+           fill   = guide_legend(override.aes = list(size = 4, stroke = 1.2)),
+           shape  = guide_legend(override.aes = list(size = 4, stroke = 1.2))) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.subtitle    = element_text(colour = "grey40", size = 11),
+      legend.position  = "bottom",
+      legend.direction = "vertical",
+      legend.title     = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.caption     = element_text(colour = "grey55", size = 9)
+    )
+  print(p)
+
+  p_name <- paste0(gsub("[^A-Za-z0-9]", "_", DAT_NAM), ".pdf")
+  f <- file.path(out_dir_fig, p_name)
+
+  save_and_show(f, width = 3.5, height = 4, function() print(p))
+
+  cat("\n\n")
+}
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

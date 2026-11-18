@@ -1,0 +1,472 @@
+---
+title: "RMB-1 SLC6A8-KO AZA + IFN-g differential expression"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  workers = 4,
+  interactive = TRUE,
+  prior_count = 2,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  data_dir = "../data/",
+  rds_dir = "../results/rds/",
+  table_dir = "../results/tables/",
+  fig_dir = "../results/figures/",
+  msigdb_dir = "../../references/MSigDb_2025.1/"
+)
+
+if(!dir.exists(params$rds_dir)){
+  dir.create(params$rds_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(params$table_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(params$fig_dir, showWarnings = FALSE, recursive = TRUE)
+}
+
+# Load packages ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(BiocParallel)
+  library(yaml)
+  library(DT)
+  library(writexl)
+  library(edgeR)
+  library(limma)
+  library(unikn)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+  library(dplyr)
+  library(data.table)
+
+})
+
+# Load functions ---------------------------------------------------------------
+source("../../scripts/functions.R", local = TRUE)
+source("../../scripts/GSEA_camera.R")
+source("../../scripts/makeFitObject.R")
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+
+de_table_cols <- c(
+  "GENEID", "SYMBOL", "DESCRIPTION", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+shiny_path <- file.path(
+  params$rds_dir, "shiny", "rds"
+)
+```
+
+# Load data
+
+```{r load-data}
+dat <- as.data.frame(fread(file.path(params$data_dir, "7BD6RX_results", "7BD6RX-expression-matrix.tsv")))
+
+count_cols <- grep("^7BD6RX_[0-9]+_count$", colnames(dat), value = TRUE)
+cnts <- as.matrix(dat[, count_cols])
+colnames(cnts) <- sub("_count$", "", colnames(cnts))
+rownames(cnts) <- dat$gene_id
+
+meta_sample <- fread(file.path(params$data_dir, "7BD6RX_results", "7BD6RX-mapping-stats-reads.csv"))
+setnames(meta_sample, 1, "SampleDescriptor")
+
+grp <- meta_sample |>
+  mutate(
+    OriginalSampleName = paste0("7BD6RX_", 1:10),
+    Condition = str_extract(SampleDescriptor, "CTRL|KO"),
+    Treatment = "AZA_IFNg",
+    Replicate = str_extract(SampleDescriptor, "rep_[0-9]+"),
+    sex = "NA",
+    CellLine = "NA"
+  ) |>
+  as.data.frame()
+
+rownames(grp) <- grp$OriginalSampleName
+
+cnts <- cnts[, match(grp$OriginalSampleName, colnames(cnts))]
+stopifnot(all(grp$OriginalSampleName == colnames(cnts)))
+
+grp$Condition <- factor(grp$Condition, levels = c("CTRL", "KO"))
+grp$Treatment <- factor(grp$Treatment, levels = c("AZA_IFNg"))
+grp$SampleGroup <- factor(
+  paste(grp$Condition, grp$Treatment, sep = "_"),
+  levels = c(
+     "CTRL_AZA_IFNg", "KO_AZA_IFNg"
+  )
+)
+
+gnes <- data.frame(
+  Symbol = dat$gene_name,
+  DESCRIPTION = NA_character_,
+  GENEID = dat$gene_id,
+  gene_biotype = dat$gene_biotype,
+  SYMBOL = dat$gene_name
+)
+rownames(gnes) <- gnes$GENEID
+
+library(org.Mm.eg.db)
+desc_map <- AnnotationDbi::mapIds(
+  org.Mm.eg.db,
+  keys      = gnes$GENEID,
+  column    = "GENENAME",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+gnes$DESCRIPTION <- unname(desc_map[gnes$GENEID])
+
+dge <- DGEList(
+  counts = cnts,
+  samples = grp,
+  genes = gnes
+)
+
+rownames(dge$genes) <- dge$genes$GENEID
+rownames(dge) <- dge$genes$GENEID
+
+dge <- dge[rowSums(dge$counts) > 0, ]
+
+gene_sets <- readRDS(file.path(params$msigdb_dir, "msigdb_v2025.1.Mm_gene_sets.rds"))
+```
+
+# Create design matrix
+
+```{r design}
+moma <- model.matrix(~ 0 + SampleGroup, data = dge$samples)
+colnames(moma) <- sub("SampleGroup", "", colnames(moma))
+```
+
+# Transform and filter data
+
+```{r}
+dge_unfilt = dge
+dge <- dge[filterByExpr(dge, design = moma), , keep.lib.sizes = FALSE]
+```
+
+# Calculate normalization factors and dispersions
+
+```{r calculate-norm-factors-dispersions}
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge, design = moma)
+log2cpm <- cpm(dge, log = TRUE, prior.count = params$prior_count)
+```
+
+# Create contrasts
+
+```{r contrasts}
+contrast_vec <- c(
+  "KO__vs__CTRL_AZA_IFNg"  = "KO_AZA_IFNg - CTRL_AZA_IFNg"
+)
+
+cntrs <- makeContrasts(
+  contrasts = contrast_vec,
+  levels = moma
+)
+colnames(cntrs) <- names(contrast_vec)
+```
+
+# Fit model and contrasts
+
+```{r model-fit}
+fit <- glmQLFit(dge, moma, prior.count = 2)
+plotQLDisp(fit, main = "Quasi-likelihood dispersion")
+```
+
+```{r contrast-fit}
+fits <- map(
+  colnames(cntrs),
+  ~ perform_contrast_fit_edgeR(fit, .x, cntrs)
+) |> rlang::set_names(colnames(cntrs))
+```
+
+# Differential expression result tables {.tabset}
+
+```{r de-tables, results='asis'}
+tt_list <- lapply(names(fits), function(fn) {
+  tt <- as.data.frame(topTags(fits[[fn]], n = Inf))
+})
+
+names(tt_list) <- names(fits)
+
+pval_cols  <- intersect(c("PValue", "FDR", "P.Value", "adj.P.Val"), round_de_table_cols)
+other_cols <- setdiff(round_de_table_cols, pval_cols)
+
+for (fn in names(tt_list)) {
+  h2(fn)
+  print(htmltools::tagList(
+    default_dt(
+      tt_list[[fn]][, de_table_cols] |>
+        dplyr::filter(FDR < params$gene_fdr_threshold)
+    ) |>
+      formatSignif(columns = pval_cols, digits = 3) |>
+      formatRound(columns = other_cols, digits = 2)
+  ))
+  cat("  \n")
+}
+```
+
+```{r}
+library(readr)
+library(UpSetR)
+```
+
+# GSEA analysis
+
+```{r}
+fits4gsea <-  fits
+rownames(dge) <- dge$genes$GENEID
+```
+
+```{r}
+perform_gsea <- function(fit, gene_set, min = 10, max = 200) {
+  if (is.null(fit$table$logFC)) {
+    warning("Data doesn't contain gene LogFC values, LogFC data will not be available for pathways.")
+  }
+
+  if (is.null(fit$gseaStatistics)) {
+    return(data.frame())
+  } else {
+    indx <- gene_set %>%
+      ids2indices(identifiers = rownames(fit$gseaStatistics$U))
+
+    indx <- indx[map_int(indx, length) %>% between(min, max)]
+
+    res <- cameraStats2Table(
+      cameraStat = fit$gseaStatistics,
+      index = indx,
+      geneLog2FC = fit$table$logFC
+    )
+    return(res)
+  }
+}
+```
+
+```{r gsea}
+collections <- unique(sort(gene_sets$collection_name)) |>
+  rlang::set_names()
+
+fits4gsea <- map(fits4gsea, ~ add_camera_stats(.x, eset = dge))
+
+compute_fraction_overlap <- function(fit, gene_set, min = 10, max = 200) {
+  indx <- gene_set %>%
+    ids2indices(identifiers = rownames(fit$gseaStatistics$U))
+
+  fractions <- sapply(indx, length) / sapply(gene_set[names(indx)], length)
+
+  indx <- indx[map_int(indx, length) %>% between(min, max)]
+  fractions <- fractions[names(indx)]
+
+  data.frame(FractionOverlap = fractions)
+}
+
+add_leading_genes <- function(res, gene_set, identifiers) {
+  if (nrow(res) == 0) return(res)
+
+  indx <- ids2indices(gene_set, identifiers = identifiers)
+  res$FractionOverlap <- purrr::map_dbl(
+    rownames(res),
+    ~ length(indx[[.x]]) / length(gene_set[[.x]])
+  )
+  res$overlapGenes <- purrr::map_chr(
+    rownames(res),
+    ~ paste(identifiers[indx[[.x]]], collapse = ",")
+  )
+  res
+}
+
+gsea_res <- map(collections, function(co, gene_sets) {
+  gs <- as.list(gene_sets[gene_sets$collection_name == co, "ensembl"])
+
+  map(fits4gsea, function(fit) {
+
+    res <- perform_gsea(fit, gs, min = 15)
+
+    if (nrow(res) == 0) return(res)
+
+    frac <- compute_fraction_overlap(fit, gs)
+    res <- merge(res, frac, by = "row.names")
+    rownames(res) <- res$Row.names
+    res$Row.names <- NULL
+
+    res$log2FC <- ifelse(res$Direction == "Down", -1*res$absLog2FC, res$absLog2FC)
+    res$abslog2FC <- NULL
+    identifiers <- rownames(fit$gseaStatistics$U)
+    add_leading_genes(res, gs, identifiers)
+  })
+}, gene_sets = gene_sets, .progress = params$interactive)
+```
+
+## Enrichment score dotplot {.tabset}
+
+```{r}
+saveRDS(
+  dge,
+  file = file.path(params$rds_dir, "dge_object.rds")
+)
+
+saveRDS(
+  dge_unfilt,
+  file = file.path(params$rds_dir, "dge_unfiltered_object.rds")
+)
+
+saveRDS(
+  log2cpm,
+  file = file.path(params$rds_dir, "log2cpm_normalized.rds")
+)
+
+saveRDS(
+  moma,
+  file = file.path(params$rds_dir, "design_matrix.rds")
+)
+
+saveRDS(
+  cntrs,
+  file = file.path(params$rds_dir, "contrast_matrix.rds")
+)
+
+saveRDS(
+  fit,
+  file = file.path(params$rds_dir, "glmQLFit_object.rds")
+)
+
+saveRDS(
+  fits,
+  file = file.path(params$rds_dir, "contrast_fits_list.rds")
+)
+
+saveRDS(
+  tt_list,
+  file = file.path(params$rds_dir, "de_results_list.rds")
+)
+
+saveRDS(
+  gsea_res,
+  file = file.path(params$rds_dir, "gsea_results_nested.rds")
+)
+```
+
+```{r export-gsea-tables, eval=params$run_gsea}
+gsea_res_dfr <- lapply(names(gsea_res), function(x) {
+  lapply(names(gsea_res[[x]]), function(y) {
+    gsea_res[[x]][[y]] |>
+      tibble::rownames_to_column(var = "Pathway") |>
+      mutate(Contrast = y, .before = 1) |>
+      mutate(MsigDb = x, .before = 1)
+  }) |>
+    bind_rows()
+}) |>
+  bind_rows()
+
+write.table(
+  gsea_res_dfr,
+  file.path(
+    params$table_dir,
+    paste0("gsea_all.txt")
+  ),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+write_xlsx(
+  gsea_res_dfr,
+  file.path(
+    params$table_dir,
+    paste0("gsea_all.xlsx")
+  )
+)
+
+write_xlsx(
+  gsea_res_dfr |>
+    dplyr::filter(FDR < params$pathway_fdr_threshold),
+  file.path(
+    params$table_dir,
+    paste0("gsea_sig.xlsx")
+  )
+)
+```
+
+```{r export-for-shiny, eval=params$run_gsea}
+if (!dir.exists(shiny_path)) {
+  dir.create(shiny_path, recursive = TRUE)
+}
+
+saveRDS(dge, file = file.path(shiny_path, "expression_set.rds"))
+
+log2cpm <- cpm(dge, log = TRUE, prior.count = 2)
+iqrs <- apply(log2cpm, 1, IQR)
+varCut <- 0.75
+sel <- iqrs > quantile(iqrs, varCut)
+pca <- prcomp(
+  scale(t(scale(t(log2cpm[sel, ]), scale = FALSE)), scale = FALSE),
+  center = FALSE
+)
+saveRDS(pca, file = file.path(shiny_path, "expression_set_pca.rds"))
+
+saveRDS(log2cpm, file = file.path(shiny_path, "log2cpm.rds"))
+
+cor_df <- expression_set_correlation(log2cpm)
+saveRDS(
+  cor_df,
+  file = file.path(shiny_path, "expression_set_correlation.rds")
+)
+
+saveRDS(fits, file = file.path(shiny_path, "limma_results.rds"))
+
+saveRDS(
+  makeFitObject(fits),
+  file = file.path(shiny_path, "limma_results_shiny.rds")
+)
+
+saveRDS(fits, file = file.path(shiny_path, "limma_results.rds"))
+
+saveRDS(gsea_res, file = file.path(shiny_path, "gsea_all.rds"))
+
+if (any(lapply(gsea_res, length) > 0)) {
+  saveRDS(
+    gsea_res,
+    file = file.path(shiny_path, "camera_results.rds")
+  )
+}
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
+

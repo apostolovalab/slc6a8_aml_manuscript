@@ -1,0 +1,290 @@
+---
+title: "TCGA-LAML data retrieval"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+# Load packages ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(DT)
+  library(edgeR)
+  library(limma)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(RColorBrewer)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+  library(dplyr)
+  library(data.table)
+  library(kableExtra)
+
+  library(TCGAbiolinks)
+  library(SummarizedExperiment)
+  library(maftools)
+})
+
+params <- list(
+  "seed" =  12435,
+  "workers" =  4,
+  "interactive" =  TRUE,
+  "rds_dir" =  "../results/rds/",
+  "table_dir" =  "../results/tables/",
+  "data_dir" =  "../data/",
+  "fig_dir" =  "../results/figures/"
+)
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+if(!dir.exists(params$rds_dir)) dir.create(params$rds_dir, recursive = TRUE)
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir, recursive = TRUE)
+if(!dir.exists(params$table_dir)) dir.create(params$table_dir, recursive = TRUE)
+
+shiny_path <- file.path(
+  params$rds_dir, "shiny", "rds"
+)
+```
+
+# Gene expression data
+
+```{r}
+## ----------------------------------------------------------------------
+query_rna <- GDCquery(
+  project       = "TCGA-LAML",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification"
+)
+output_query_rna <- getResults(query_rna)
+
+dim(output_query_rna)
+```
+
+```{r}
+GDCdownload(query_rna, directory = "../data/")
+dat_temp <- GDCprepare(query_rna, directory = "../data/", summarizedExperiment = FALSE)
+```
+
+```{r}
+mtx <- dat_temp[,-c(1:3)]
+mtx_names <- gsub("_TCGA.*", "", colnames(mtx))
+table(mtx_names)
+```
+
+```{r}
+rowdat <- dat_temp[,c(1:3)]
+rowdat$gene_id <- sub("\\..*$", "", rowdat$gene_id)
+mtx <- as.data.frame(mtx[!which(duplicated(rowdat$gene_id)), ])
+rowdat <- as.data.frame(rowdat[!which(duplicated(rowdat$gene_id)), ])
+
+mtx_list <- SimpleList(counts             = as.matrix(mtx[,mtx_names == "unstranded"]),
+                       unstranded         = as.matrix(mtx[,mtx_names == "unstranded"]),
+                       tpm_unstranded     = as.matrix(mtx[,mtx_names == "tpm_unstranded"]),
+                       fpkm_unstranded    = as.matrix(mtx[,mtx_names == "fpkm_unstranded"]),
+                       fpkm_uq_unstranded = as.matrix(mtx[,mtx_names == "fpkm_uq_unstranded"])
+                       )
+
+mtx_list <- lapply(mtx_list, function(x){
+  colnames(x) <-  gsub(".*_TCGA-", "", colnames(x))
+  colnames(x) <-  paste0("TCGA-", colnames(x))
+  x
+})
+
+se <- SummarizedExperiment(assays  = mtx_list,
+                           rowData = rowdat)
+rownames(se) <- rowdat$gene_id
+colData(se)$id <- colnames(se)
+colData(se)$patient_id <- gsub("-[[:alnum:]]*-[[:alnum:]]*-[0-9]*-[0-9]*$", "", se$id)
+```
+
+# Clincial data
+
+```{r}
+## ----------------------------------------------------------------------
+
+query_clin <- GDCquery(
+  project       = "TCGA-LAML",
+  data.category = "Clinical",
+  access        = "open",
+  data.type     = "Clinical Supplement",
+  data.format   = "BCR Biotab"
+)
+output_query_clin <- getResults(query_clin)
+```
+
+```{r}
+GDCdownload(query_clin, directory = "../data/")
+clin_list   <- GDCprepare(query_clin, directory = "../data/")
+```
+
+```{r}
+clin_patient <- clin_list$clinical_patient_laml
+
+clin_patient <- clin_patient[-c(1:2), ]
+clin_patient <- clin_patient[match(se$patient_id, clin_patient$bcr_patient_barcode), ]
+
+colData(se) <- cbind(colData(se), clin_patient)
+```
+
+# Somatic mutation
+
+```{r}
+## ----------------------------------------------------------------------
+
+query_maf <- GDCquery(
+  project       = "TCGA-LAML",
+  data.category = "Simple Nucleotide Variation",
+  access = "open"
+)
+
+output_query_maf <- getResults(query_maf)
+```
+
+```{r}
+GDCdownload(query_maf, directory = "../data/")
+maf <- GDCprepare(query_maf, directory = "../data/")
+```
+
+```{r}
+maf_genes <- c("NPM1", "RUNX1", "ASXL1", "TP53")
+maf_nonsilent <- maf %>% filter(Variant_Classification != "Silent")
+
+mut_status <- lapply(maf_genes, function(g) {
+  mutated <- unique(substr(
+    maf_nonsilent$Tumor_Sample_Barcode[maf_nonsilent$Hugo_Symbol == g], 1, 12))
+  data.frame(patient = mutated, gene = g, mut = 1L)
+}) %>% bind_rows()
+
+mut_wide <- mut_status %>%
+  tidyr::pivot_wider(names_from = gene, values_from = mut, values_fill = 0L)
+```
+
+## FLT3-ITD
+
+```{r}
+download.file(
+  "https://api.gdc.cancer.gov/data/b9196563-a05d-40b8-80dc-640ec712eb06",
+  destfile = "../data/LAML_SuppTable01.xlsx", mode = "wb"
+)
+
+supp01 <- readxl::read_excel("../data/LAML_SuppTable01.xlsx")
+table(supp01$FLT3)
+```
+
+```{r}
+supp01 <- supp01 %>%
+  mutate(
+    FLT3_raw = as.character(FLT3),
+    FLT3_ITD = case_when(
+      grepl("in_frame_ins", FLT3_raw, ignore.case = TRUE) ~ 1L,
+      is.na(FLT3_raw) | FLT3_raw %in% c("", "56") ~ 0L,
+      TRUE ~ 0L
+    ),
+    FLT3_TKD = case_when(
+      grepl("^p\\.D8(35|39)", FLT3_raw) ~ 1L,
+      TRUE ~ 0L
+    )
+  )
+
+supp01 <- supp01[-nrow(supp01), ]
+
+table(FLT3_ITD = supp01$FLT3_ITD, FLT3_TKD = supp01$FLT3_TKD)
+```
+
+# Combine all modalities
+
+```{r}
+supp01 <- supp01 %>%
+  mutate(patient = paste0("TCGA-AB-", `TCGA Patient ID`))
+
+mut_flt3 <- mut_wide %>%
+  full_join(supp01 %>% select(patient, FLT3_ITD, FLT3_TKD), by = "patient")
+
+cd <- as.data.frame(colData(se))
+cd_joined <- cd %>%
+  left_join(mut_flt3, by = c("patient_id" = "patient"))
+
+stopifnot(nrow(cd_joined) == ncol(se))
+rownames(cd_joined) <- rownames(colData(se))
+
+mut_cols <- c("NPM1", "RUNX1", "ASXL1", "TP53", "FLT3_ITD", "FLT3_TKD")
+
+cd_joined <- cd_joined %>%
+  mutate(across(all_of(mut_cols), ~ tidyr::replace_na(., 0L)))
+
+colData(se) <- DataFrame(cd_joined)
+```
+
+```{r}
+cd <- as.data.frame(colData(se))
+
+diff_cols <- c(
+  "blast_count", "promyelocytes_count", "myelocytes_24hr_of_banking",
+  "metamyelocytes_24hr_of_banking", "bands_24hr_of_banking",
+  "segs_24hr_of_banking", "basophils_count...42", "basophils_count...43",
+  "lymphocytes_count", "monocytes_count", "prolymphocytes_24hr_of_banking",
+  "promonocytes_24hr_of_banking", "abnormal_lymphocyte_percent"
+)
+
+diff_num <- cd %>%
+  select(patient_id, all_of(diff_cols)) %>%
+  mutate(across(all_of(diff_cols), ~ suppressWarnings(as.numeric(.))))
+
+diff_num <- diff_num %>%
+  mutate(
+    diff_sum  = rowSums(across(all_of(diff_cols)), na.rm = TRUE),
+    n_missing = rowSums(across(all_of(diff_cols), is.na))
+  )
+
+diff_num <- diff_num %>%
+  mutate(
+    blast_pct = case_when(
+      n_missing == 0 & diff_sum >= 90 & diff_sum <= 110 ~ as.numeric(blast_count),
+      TRUE ~ NA_real_
+    )
+  )
+
+cd <- cd %>%
+  left_join(diff_num %>% select(patient_id, blast_pct), by = "patient_id")
+
+stopifnot(nrow(cd) == ncol(se))
+rownames(cd) <- rownames(colData(se))
+colData(se)$blast_pct <- cd$blast_pct
+```
+
+```{r}
+saveRDS(se, file = file.path(params$rds_dir, "se_tcga.rds"))
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

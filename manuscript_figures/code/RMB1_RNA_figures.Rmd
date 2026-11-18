@@ -1,0 +1,2236 @@
+---
+title: " RMB1-related figures"
+subtitle: "Creatine Manuscript"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  workers = 4,
+  interactive = TRUE,
+  prior_count = 2,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  fig_dir = "../results/figures/RMB1_model/"
+)
+
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir)
+
+# Load packages ----------------------------------------------------------------
+library(BiocParallel)
+library(yaml)
+library(DT)
+library(writexl)
+library(edgeR)
+library(limma)
+library(unikn)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(pheatmap)
+library(RColorBrewer)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(forcats)
+library(ggpointdensity)
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+
+de_table_cols <- c(
+  "ENTREZID", "GENEID", "SYMBOL", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+```
+
+# RMB1 run 2 AZA+Tcells (main figure)
+
+```{r}
+params$data <-  "../../mrnaseq_rmb1_slc6a8_ko_run2/results/"
+
+dge     <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_run2/results/rds/dge_object.rds")
+log2cpm <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_run2/results/rds/log2cpm_normalized.rds")
+
+gene_sets <- readRDS(file.path(msigdb_dir, "msigdb_v2025.1.Mm_gene_sets.rds"))
+
+pca_res   <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_run2/results/rds/shiny/rds/expression_set_pca.rds")
+
+fits <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_run2/results/rds/shiny/rds/limma_results.rds")
+res <- list()
+res$KO__vs__NTC_AZA_Tcells <- fread("../../mrnaseq_rmb1_slc6a8_ko_run2/results/tables/diffexp_KO__vs__NTC_AZA_Tcells.txt")
+res$KO__vs__NTC_Vehicle <- fread("../../mrnaseq_rmb1_slc6a8_ko_run2/results/tables/diffexp_KO__vs__NTC_Vehicle.txt")
+
+gsea_res_dfr <- readxl::read_excel("../../mrnaseq_rmb1_slc6a8_ko_run2/results/tables/gsea_sig.xlsx")
+sig  <- subset(gsea_res_dfr, FDR < 0.05)
+cols <- c("MsigDb", "Contrast", "Pathway", "NGenes", "FractionOverlap", "Direction",
+          "absLog2FC", "PValue", "FDR")
+sig  <- sig[, intersect(cols, names(sig)), drop = FALSE]
+
+tf_act <- fread("../../mrnaseq_rmb1_slc6a8_ko_run2/results/tables/TF_activity_TF_activity_all.csv")
+net <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_run2/data/collectri_mouse_stat1Extended.rds")
+
+contrasts <- sort(unique(sig$Contrast))
+msigdbs   <- sort(unique(sig$MsigDb))
+```
+
+## Figure 6B-C : volcano plot
+
+```{r}
+fdr_thresh <- 0.05
+fc_thresh  <- 0.5
+
+pub_volcano_theme <- theme_classic(base_size = 13) +
+  theme(
+    plot.title       = element_blank(),
+    plot.subtitle    = element_blank(),
+    axis.text        = element_text(size = 12, color = "grey20"),
+    axis.title       = element_text(size = 13),
+    legend.title     = element_blank(),
+    legend.text      = element_text(size = 11),
+    legend.key.size  = unit(0.8, "lines"),
+    panel.grid.major = element_line(color = "grey93", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(6, 10, 6, 6),
+    legend.position  = "right"
+  )
+
+make_volcano <- function(df, comparison_label,
+                         fdr_thresh = 0.05, fc_thresh = 0.5, fc_cap = 8) {
+
+  df <- df %>%
+    mutate(
+      neg_log10_fdr = -log10(FDR),
+      group = case_when(
+        FDR < fdr_thresh & logFC >=  fc_thresh ~ "Up",
+        FDR < fdr_thresh & logFC <= -fc_thresh ~ "Down",
+        TRUE                                   ~ "ns"
+      ),
+      group = factor(group, levels = c("Up", "Down", "ns")),
+      logFC_plot = pmax(pmin(logFC, fc_cap), -fc_cap)
+    )
+
+  n_up   <- sum(df$group == "Up",   na.rm = TRUE)
+  n_down <- sum(df$group == "Down", na.rm = TRUE)
+
+  cols <- c("Up" = "#D6604D", "Down" = "#4393C3", "ns" = "grey75")
+
+  p <- ggplot(df, aes(x = logFC_plot, y = neg_log10_fdr, color = group)) +
+    geom_point(data = filter(df, group == "ns"),
+               size = 0.8, alpha = 0.3, shape = 16) +
+    geom_point(data = filter(df, group != "ns"),
+               size = 1.4, alpha = 0.7, shape = 16) +
+    geom_hline(yintercept = -log10(fdr_thresh),
+               linetype = "dashed", linewidth = 0.4, color = "grey45") +
+    geom_vline(xintercept = c(-fc_thresh, fc_thresh),
+               linetype = "dashed", linewidth = 0.4, color = "grey45") +
+    scale_color_manual(
+      values = cols,
+      breaks = c("Up", "Down", "ns"),
+      labels = c(paste0("Up (n = ", n_up, ")"),
+                 paste0("Down (n = ", n_down, ")"),
+                 "Not significant")
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.06))) +
+    labs(
+      x = expression("Log"[2]*" fold change"),
+      y = expression("-log"[10]*"(FDR)")
+    ) +
+    theme_classic(base_size = 18) +
+    theme(
+      plot.title       = element_blank(),
+      plot.subtitle    = element_blank(),
+      axis.text        = element_text(size = 14, color = "grey20"),
+      axis.title       = element_text(size = 15),
+
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 13),
+      legend.key.size  = unit(0.6, "lines"),
+
+      legend.box.spacing = unit(2, "pt"),
+      legend.spacing.x   = unit(2, "pt"),
+      legend.margin      = margin(0, 0, 0, 0),
+
+      panel.grid.major = element_line(color = "grey93", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+
+      plot.margin      = margin(6, 4, 6, 6),
+      legend.position  = "right"
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 2.5, alpha = 1)))
+
+
+  list(plot = p, n_up = n_up, n_down = n_down)
+}
+```
+
+```{r fig.width=3.5, fig.height=2.5}
+volcano_results <- lapply(names(res), function(comp) {
+  make_volcano(res[[comp]], comparison_label = comp,
+              fdr_thresh = fdr_thresh, fc_thresh = fc_thresh)
+})
+names(volcano_results) <- names(res)
+
+
+print(volcano_results[[1]])
+file_name <- paste0("volcano_", names(volcano_results)[1], ".pdf")
+ggsave(
+  filename = file.path(params$fig_dir, file_name),
+  plot     = volcano_results[[1]]$plot,
+  width    = 3.5, height = 2.5
+)
+
+print(volcano_results[[2]])
+file_name <- paste0("volcano_", names(volcano_results)[2], ".pdf")
+ggsave(
+  filename = file.path(params$fig_dir, file_name),
+  plot     = volcano_results[[2]]$plot,
+  width    = 3.5, height = 2.5
+)
+```
+
+## Figure 6C: Number of dysregulated pahtways
+
+```{r}
+fdr_thresh_path <- 0.05
+
+pathway_counts <- gsea_res_dfr %>%
+  filter(MsigDb %in% c("M5:GO:BP", "MH", "M2:CP:REACTOME")) %>%
+  filter(FDR < fdr_thresh_path) %>%
+  mutate(
+    collection = dplyr::recode(MsigDb,
+                               "M5:GO:BP"       = "GO:BP",
+                               "MH"             = "Hallmark",
+                               "M2:CP:REACTOME" = "Reactome"),
+    collection = factor(collection, levels = c("GO:BP", "Hallmark", "Reactome")),
+    direction  = ifelse(log2FC > 0, "Up", "Down"),
+    direction  = factor(direction, levels = c("Down", "Up")),
+    contrast_label = case_when(
+      grepl("Vehicle", Contrast) ~ "VEH",
+      grepl("AZA",     Contrast) ~ "AZA+Tc",
+      TRUE                       ~ Contrast
+    ),
+    contrast_label = factor(contrast_label, levels = c("VEH", "AZA+Tc"))
+  ) %>%
+  count(collection, contrast_label, direction, name = "n_pathways")
+
+bar_totals <- pathway_counts %>%
+  group_by(collection, contrast_label) %>%
+  summarise(total = sum(n_pathways), .groups = "drop")
+
+dir_cols <- c("Up" = "#D6604D", "Down" = "#4393C3")
+
+pub_bar_theme <- theme_classic(base_size = 13) +
+  theme(
+    plot.title        = element_blank(),
+    plot.subtitle     = element_blank(),
+    axis.text.x       = element_text(size = 12, color = "grey20"),
+    axis.text.y       = element_text(size = 11, color = "grey20"),
+    axis.title        = element_text(size = 13),
+    legend.title      = element_blank(),
+    legend.text       = element_text(size = 11),
+    strip.text        = element_text(size = 13, face = "bold"),
+    strip.background  = element_rect(fill = "grey94", color = NA),
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor    = element_blank(),
+    plot.margin        = margin(6, 10, 6, 6),
+    legend.position    = "top"
+  )
+
+p_pathways <- ggplot(pathway_counts,
+                     aes(x = contrast_label, y = n_pathways, fill = direction)) +
+  geom_col(width = 0.65, alpha = 0.9) +
+  geom_text(
+    data = bar_totals,
+    aes(x = contrast_label, y = total, label = total, fill = NULL),
+    vjust = -0.4, size = 4, fontface = "bold", color = "grey20"
+  ) +
+  facet_wrap(~ collection, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = dir_cols, breaks = c("Up", "Down")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "N. dysregulated pathways") +
+  pub_bar_theme
+```
+
+```{r fig.width=5, fig.height=3}
+p_pathways
+
+file_name_pathways <- "pathway_counts_GOBP_Hallmark_Reactome.pdf"
+ggsave(file.path(params$fig_dir, file_name_pathways),
+       p_pathways, width = 5, height = 3)
+```
+
+```{r}
+pub_bar_theme_h <- theme_classic(base_size = 13) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+
+    axis.text.x        = element_text(size = 11, color = "grey20"),
+    axis.text.y        = element_text(size = 12, color = "grey20"),
+    axis.title         = element_text(size = 13),
+
+    legend.title       = element_blank(),
+    legend.text        = element_text(size = 11),
+
+    strip.text         = element_text(size = 13, face = "bold"),
+    strip.background   = element_rect(fill = "grey94", color = NA),
+
+    panel.grid.major.x = element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+
+    plot.margin        = margin(6, 10, 6, 6),
+    legend.position    = "top"
+  )
+
+p_pathways_h <- ggplot(
+  pathway_counts,
+  aes(
+    x = n_pathways,
+    y = contrast_label,
+    fill = direction
+  )
+) +
+  geom_col(
+    width = 0.65,
+    alpha = 0.9
+  ) +
+  geom_text(
+    data = bar_totals,
+    aes(
+      x = total,
+      y = contrast_label,
+      label = total,
+      fill = NULL
+    ),
+    hjust = -0.4,
+    size = 4,
+    fontface = "bold",
+    color = "grey20"
+  ) +
+  facet_wrap(
+    ~ collection,
+    scales = "free_x",
+    ncol = 1
+  ) +
+  scale_fill_manual(
+    values = dir_cols,
+    breaks = c("Up", "Down")
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    x = "N. dysregulated pathways",
+    y = NULL
+  ) +
+  pub_bar_theme_h
+```
+
+```{r fig.width=4.2, fig.height=4.3}
+p_pathways_h
+
+file_name_pathways <- "pathway_counts_GOBP_Hallmark_Reactome_horizontal.pdf"
+ggsave(file.path(params$fig_dir, file_name_pathways),
+       p_pathways_h, width = 4.2, height = 4.3)
+```
+
+## Figure 6 D
+
+```{r}
+fdr_thresh_path <- 0.05
+n_top            <- 5
+
+clean_pathway_label <- function(x, max_width = 40) {
+  x %>%
+    gsub("^HALLMARK_|^GOBP_|^GOCC_|^GOMF_|^KEGG_|^REACTOME_|^WP_", "", .) %>%
+    gsub("_", " ", .) %>%
+    stringr::str_to_upper() %>%
+    stringr::str_wrap(width = max_width)
+}
+
+pub_gsea_theme <- theme_classic(base_size = 15) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+    axis.text.y        = element_text(size = 14, face = "bold", color = "black"),
+    axis.text.x        = element_text(size = 14, color = "black"),
+    axis.title.x       = element_text(size = 15, face = "plain"),
+    axis.title.y       = element_blank(),
+    legend.title       = element_text(size = 14, face = "bold"),
+    legend.text        = element_text(size = 13),
+    legend.key.size    = unit(1.1, "lines"),
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.4),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(10, 20, 10, 10)
+  )
+
+make_hallmark_lollipop <- function(contrast_name, gsea_res_dfr,
+                                   fdr_thresh = 0.05, n_top = 5) {
+
+  df <- gsea_res_dfr %>%
+    filter(MsigDb == "MH", Contrast == contrast_name, FDR < fdr_thresh)
+
+  if (nrow(df) == 0) return(NULL)
+
+  top_up   <- df %>% filter(log2FC > 0) %>% arrange(FDR) %>% slice_head(n = n_top)
+  top_down <- df %>% filter(log2FC < 0) %>% arrange(FDR) %>% slice_head(n = n_top)
+
+  top_df <- bind_rows(top_up, top_down) %>%
+    mutate(
+      neg_log10_fdr = -log10(FDR),
+      stem_color    = ifelse(log2FC < 0, "#4393C3", "#D6604D"),
+      label         = clean_pathway_label(Pathway)
+    ) %>%
+    arrange(desc(log2FC)) %>%
+    mutate(label = factor(label, levels = rev(unique(label))))
+
+  if (nrow(top_df) == 0) return(NULL)
+
+  x_abs    <- max(abs(top_df$log2FC), na.rm = TRUE) * 1.2
+  x_lim    <- c(-x_abs, x_abs)
+  x_breaks <- round(c(-x_abs, 0, x_abs), 2)
+  fdr_max  <- ceiling(max(top_df$neg_log10_fdr, na.rm = TRUE))
+
+  p <- ggplot(top_df, aes(x = log2FC, y = label)) +
+    geom_segment(
+      aes(xend = 0, yend = label, color = stem_color),
+      linewidth = 1.1
+    ) +
+    scale_color_identity() +
+    ggnewscale::new_scale_color() +
+    geom_point(
+      aes(color = neg_log10_fdr, size = FractionOverlap),
+      shape = 16, alpha = 0.92
+    ) +
+    geom_vline(xintercept = 0, linewidth = 0.7,
+               linetype = "dotted", color = "grey30") +
+    scale_color_gradientn(
+      colours = viridis::inferno(5, alpha = 1, end = 0.9),
+      name    = expression(bold(-log[10](FDR))),
+      limits  = c(0, fdr_max),
+      breaks  = pretty(c(0, fdr_max), n = 4)
+    ) +
+    scale_size_continuous(
+      range  = c(4, 12),
+      name   = "% genes in\npathway",
+      labels = scales::percent_format(accuracy = 1),
+      breaks = pretty(top_df$FractionOverlap, n = 3)
+    ) +
+    scale_x_continuous(limits = x_lim, breaks = x_breaks) +
+    labs(x = "log2FC") +
+    pub_gsea_theme +
+    guides(
+      color = guide_colorbar(title.position = "top", barwidth = 0.9,
+                             barheight = 6, order = 1),
+      size  = guide_legend(title.position = "top", order = 2,
+                           override.aes = list(color = "grey50"))
+    )
+
+  list(plot = p, n_up = nrow(top_up), n_down = nrow(top_down))
+}
+```
+
+```{r fig.width=7, fig.height=4.7}
+hallmark_plots <- lapply(names(res), function(comp) {
+  make_hallmark_lollipop(comp, gsea_res_dfr,
+                         fdr_thresh = fdr_thresh_path, n_top = n_top)
+})
+names(hallmark_plots) <- names(res)
+
+N=2
+hallmark_plots[[N]]$plot
+file_name <- paste0("hallmark_lollipop_", names(hallmark_plots)[N], ".pdf")
+ggsave(file.path(params$fig_dir, file_name), hallmark_plots[[N]]$plot, width = 7, height = 3.4)
+
+N=1
+hallmark_plots[[N]]$plot
+file_name <- paste0("hallmark_lollipop_", names(hallmark_plots)[N], ".pdf")
+ggsave(file.path(params$fig_dir, file_name), hallmark_plots[[N]]$plot, width = 7, height = 4.7)
+```
+
+## Extra: barcode plots of the top pathways
+
+```{r fig.width=6, fig.height=4.8}
+library(clusterProfiler)
+library(enrichplot)
+
+get_stat <- function(contrast) {
+  if (exists("fits") && !is.null(fits[[contrast]])) {
+    stat <- fits[[contrast]]$table$logFC
+    names(stat) <- fits[[contrast]]$genes$GENEID
+  } else {
+    stat <- res[[contrast]]$logFC
+    names(stat) <- res[[contrast]]$GENEID
+  }
+  stat
+}
+
+get_ranked <- function(contrast) {
+  stat <- get_stat(contrast)
+  stat <- stat[!is.na(stat) & !duplicated(names(stat))]
+  sort(stat, decreasing = TRUE)
+}
+
+select_hallmark_paths <- function(contrast_name, gsea_res_dfr,
+                                  fdr_thresh = 0.05, n_top = 5) {
+  df <- gsea_res_dfr %>%
+    filter(MsigDb == "MH", Contrast == contrast_name, FDR < fdr_thresh)
+
+  bind_rows(
+    df %>% filter(log2FC > 0) %>% arrange(FDR) %>% slice_head(n = n_top),
+    df %>% filter(log2FC < 0) %>% arrange(FDR) %>% slice_head(n = n_top)
+  )
+}
+
+make_gseaplot <- function(ranked, pw, pw_ensembl, main_title,
+                          line_col = "green", base_size = 14) {
+
+  pw_genes <- intersect(pw_ensembl, names(ranked))
+  if (length(pw_genes) < 5) return(NULL)
+
+  t2g <- data.frame(term = pw, gene = pw_genes)
+
+  gs <- suppressWarnings(
+    clusterProfiler::GSEA(
+      geneList      = ranked,
+      TERM2GENE     = t2g,
+      minGSSize     = 5,
+      maxGSSize     = 5000,
+      pvalueCutoff  = 1,
+      eps           = 0,
+      seed          = TRUE,
+      verbose       = FALSE
+    )
+  )
+  if (nrow(gs@result) == 0) return(NULL)
+
+  enrichplot::gseaplot2(
+    gs, geneSetID = 1,
+    title      = main_title,
+    color      = line_col,
+    base_size  = base_size,
+    rel_heights = c(1.5, 0.5, 0.7),
+    subplots   = 1:3,
+    pvalue_table = FALSE
+  )
+}
+
+for (contrast in names(res)) {
+
+  sig_paths <- select_hallmark_paths(contrast, gsea_res_dfr,
+                                     fdr_thresh = fdr_thresh_path, n_top = n_top)
+  if (nrow(sig_paths) == 0) next
+
+  ranked     <- get_ranked(contrast)
+  cont_print <- gsub("__", " ", contrast)
+
+  for (i in seq_len(nrow(sig_paths))) {
+
+    pw  <- sig_paths$Pathway[i]
+    fc  <- round(sig_paths$log2FC[i], 2)
+    fdr <- signif(sig_paths$FDR[i], 2)
+
+    pw_ensembl <- unlist(gene_sets$ensembl[gene_sets$geneset_name == pw])
+
+    main_title <- paste0(pw, "\n", "log2FC: ", fc, " | FDR: ", fdr)
+
+    p <- make_gseaplot(ranked, pw, pw_ensembl, main_title)
+    if (is.null(p)) next
+
+    print(p)
+    dir.create(file.path(params$fig_dir, "GSEAplot"),showWarnings = FALSE)
+    file_name <- paste0("GSEAplot_", pw, "_", contrast, ".pdf")
+    ggsave(file.path(params$fig_dir, "GSEAplot", file_name), p,
+           width = 6, height = 4.8)
+
+  }
+}
+```
+
+## Figure 6E: HLA (equivalent) genes in volcano plots
+
+```{r}
+library(ggrepel)
+
+mhcii_genes <- c("H2-Aa", "H2-Ab1", "H2-Ea", "H2-Eb1",
+                 "H2-DMa", "H2-DMb1", "H2-DMb2", "H2-Oa", "H2-Ob")
+
+make_volcano_mhcii <- function(df, comparison_label, highlight = mhcii_genes,
+                               fdr_thresh = 0.05, fc_thresh = 0.5, fc_cap = 8) {
+
+  df <- df %>%
+    mutate(
+      neg_log10_fdr = -log10(FDR),
+      group = case_when(
+        Symbol %in% highlight                  ~ "MHC-II",
+        FDR < fdr_thresh & logFC >=  fc_thresh ~ "Up",
+        FDR < fdr_thresh & logFC <= -fc_thresh ~ "Down",
+        TRUE                                   ~ "ns"
+      ),
+      group      = factor(group, levels = c("Up", "Down", "MHC-II", "ns")),
+      logFC_plot = pmax(pmin(logFC, fc_cap), -fc_cap)
+    )
+
+  n_up   <- sum(df$group == "Up",   na.rm = TRUE)
+  n_down <- sum(df$group == "Down", na.rm = TRUE)
+  lab_df <- filter(df, group == "MHC-II")
+  n_mhc  <- nrow(lab_df)
+
+  cols <- c("Up" = "#D6604D", "Down" = "#4393C3",
+            "MHC-II" = "#7B3294", "ns" = "grey75")
+
+  p <- ggplot(df, aes(x = logFC_plot, y = neg_log10_fdr, color = group)) +
+    geom_point(data = filter(df, group == "ns"),
+               size = 0.8, alpha = 0.3, shape = 16) +
+    geom_point(data = filter(df, group %in% c("Up", "Down")),
+               size = 1.4, alpha = 0.7, shape = 16) +
+    geom_point(data = lab_df, size = 2.6, alpha = 1, shape = 16) +
+    geom_hline(yintercept = -log10(fdr_thresh),
+               linetype = "dashed", linewidth = 0.4, color = "grey45") +
+    geom_vline(xintercept = c(-fc_thresh, fc_thresh),
+               linetype = "dashed", linewidth = 0.4, color = "grey45") +
+    geom_label_repel(
+      data = lab_df, aes(label = Symbol),
+      color = "#7B3294", fill = "white", fontface = "bold",
+      size = 4, label.size = 0.3, box.padding = 0.6, point.padding = 0.3,
+      segment.color = "grey40", segment.size = 0.3,
+      max.overlaps = Inf, min.segment.length = 0, seed = 42,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(
+      values = cols,
+      breaks = c("MHC-II", "Up", "Down", "ns"),
+      labels = c("MHC-II genes",
+                 paste0("Up (n = ", n_up, ")"),
+                 paste0("Down (n = ", n_down, ")"),
+                 "Not significant")
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.06))) +
+    labs(x = expression("Log"[2]*" fold change"),
+         y = expression("-log"[10]*"(FDR)")) +
+    theme_classic(base_size = 15) +
+    theme(
+      plot.title       = element_blank(),
+      plot.subtitle    = element_blank(),
+      axis.text        = element_text(size = 13, color = "grey20"),
+      axis.title       = element_text(size = 14),
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 12),
+      legend.key.size  = unit(0.8, "lines"),
+      panel.grid.major = element_line(color = "grey93", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      plot.margin      = margin(6, 10, 6, 6),
+      legend.box.spacing = unit(2, "pt"),
+      legend.position  = "right"
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 2.5, alpha = 1)))
+
+
+  list(plot = p)
+}
+```
+
+```{r fig.width=5, fig.height=3.5}
+volcano_mhcii <- lapply(names(res), function(comp)
+  make_volcano_mhcii(res[[comp]], comp,
+                     fdr_thresh = fdr_thresh, fc_thresh = fc_thresh))
+names(volcano_mhcii) <- names(res)
+
+for (comp in names(volcano_mhcii)) {
+  file_name <- paste0("volcano_MHCII_", comp, ".pdf")
+  ggsave(file.path(params$fig_dir, file_name),
+         volcano_mhcii[[comp]]$plot, width = 5, height = 3.5)
+}
+
+volcano_mhcii[["KO__vs__NTC_Vehicle"]]$plot
+volcano_mhcii[["KO__vs__NTC_AZA_Tcells"]]$plot
+```
+
+## Figure 6H: TFs activation/repression
+
+```{r  fig.width=5.5, fig.height=3}
+tf_counts <- tf_act %>%
+  as.data.frame() %>%
+  filter(sig) %>%
+  mutate(
+    dir = factor(dir, levels = c("Activated in KO", "Repressed in KO")),
+    treatment = factor(
+      dplyr::recode(contrast, "VEH" = "Vehicle", "AZA_Tcells" = "AZA+T cells"),
+      levels = c("Vehicle", "AZA+T cells")
+    )
+  ) %>%
+  count(treatment, dir, name = "n_tf") %>%
+  tidyr::complete(treatment, dir, fill = list(n_tf = 0))
+
+trt_cols <- c("Vehicle" = "#4393C3", "AZA+T cells" = "#D6604D")
+
+pub_tf_theme <- theme_bw(base_size = 14) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+    axis.text          = element_text(size = 13, color = "black"),
+    axis.title.y       = element_text(size = 14),
+    axis.title.x       = element_blank(),
+    legend.position    = "none",
+    strip.text         = element_text(size = 14, face = "bold"),
+    strip.background   = element_rect(fill = "grey94", color = NA),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.margin        = margin(6, 10, 6, 6)
+  )
+
+p_tf <- ggplot(tf_counts, aes(x = treatment, y = n_tf, color = treatment)) +
+  geom_segment(aes(xend = treatment, y = 0, yend = n_tf), linewidth = 1.2) +
+  geom_point(size = 5) +
+  geom_text(aes(label = n_tf), vjust = -1.1, size = 5, fontface = "bold",
+            show.legend = FALSE) +
+  facet_wrap(~ dir, scales = "free_y", nrow = 1) +
+  scale_color_manual(values = trt_cols) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(y = "N. TFs (FDR < 0.05)") +
+  pub_tf_theme
+
+p_tf
+
+file_name_tf <- "TF_activity_counts_lollipop.pdf"
+ggsave(file.path(params$fig_dir, file_name_tf), p_tf, width = 5.5, height = 3)
+```
+
+```{r fig.width=5.5, fig.height=3}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+tf_sig <- tf_act %>%
+  as.data.frame() %>%
+  filter(sig) %>%
+  mutate(
+    dir_short = ifelse(dir == "Activated in KO", "Activated", "Repressed"),
+    treatment = dplyr::recode(contrast, "VEH" = "Vehicle", "AZA_Tcells" = "AZA+T cells")
+  )
+
+tf_counts <- tf_sig %>%
+  mutate(
+    dir_short = factor(dir_short, levels = c("Activated", "Repressed")),
+    treatment = factor(treatment, levels = c("Vehicle", "AZA+T cells"))
+  ) %>%
+  count(treatment, dir_short, name = "n_tf") %>%
+  tidyr::complete(treatment, dir_short, fill = list(n_tf = 0))
+
+dir_cols <- c("Activated" = "#D6604D", "Repressed" = "#4393C3")
+
+p_tf_bar <- ggplot(tf_counts, aes(x = treatment, y = n_tf, fill = dir_short)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65, alpha = 0.9) +
+  geom_text(aes(label = n_tf),
+            position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 5, fontface = "bold", color = "grey20") +
+  scale_fill_manual(values = dir_cols, name = NULL,
+                    labels = c("Activated in KO", "Repressed in KO")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "N. TFs (FDR < 0.05)") +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+    axis.text          = element_text(size = 13, color = "black"),
+    axis.title.y       = element_text(size = 14),
+    legend.text        = element_text(size = 13),
+    legend.position    = "top",
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    plot.margin        = margin(6, 10, 6, 6)
+  )
+
+p_tf_bar
+
+file_tf_bar <- "TF_activity_counts_bars.pdf"
+ggsave(file.path(params$fig_dir, file_tf_bar), p_tf_bar, width = 5.5, height = 3)
+```
+
+```{r fig.width=7.2, fig.height=4}
+library(ComplexUpset)
+
+tf_sig <- tf_sig %>%
+  mutate(set = paste0(dir_short, " (", treatment, ")"))
+
+set_levels <- c("Activated (Vehicle)", "Activated (AZA+T cells)",
+                "Repressed (Vehicle)", "Repressed (AZA+T cells)")
+
+tf_wide <- tf_sig %>%
+  distinct(source, set) %>%
+  mutate(member = TRUE) %>%
+  tidyr::pivot_wider(names_from = set, values_from = member, values_fill = FALSE) %>%
+  as.data.frame()
+
+for (s in set_levels) if (!s %in% names(tf_wide)) tf_wide[[s]] <- FALSE
+
+set_queries <- list(
+  upset_query(set = "Activated (Vehicle)",        fill = "#D6604D"),
+  upset_query(set = "Activated (AZA+T cells)",  fill = "#D6604D"),
+  upset_query(set = "Repressed (Vehicle)",        fill = "#4393C3"),
+  upset_query(set = "Repressed (AZA+T cells)",  fill = "#4393C3")
+)
+
+p_tf_upset <- ComplexUpset::upset(
+  tf_wide,
+  intersect  = set_levels,
+  name       = NULL,
+  min_size   = 1,
+  width_ratio = 0.3,
+  sort_sets  = FALSE,
+  sort_intersections_by = "cardinality",
+  queries    = set_queries,
+  base_annotations = list(
+    "Number of TFs" = intersection_size(
+      counts  = TRUE,
+      text    = list(size = 5),
+      mapping = aes(fill = "bar")
+    ) +
+      scale_fill_manual(values = c("bar" = "grey30"), guide = "none") +
+      ylab("")
+  ),
+  set_sizes = upset_set_size() + ylab("N. TFs (FDR<0.05)"),
+  themes = upset_modify_themes(list(
+    "intersections_matrix" = theme(text = element_text(size = 14),
+                                   axis.text.y = element_text(size = 13, color = "black")),
+    "overall_sizes"        = theme(text = element_text(size = 13),
+                                   axis.text.x = element_text(size = 11)),
+    "Number of TFs"        = theme(
+      text         = element_text(size = 14),
+      axis.text.y  = element_text(size = 13, color = "black"),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_text(vjust = 4)
+    )
+  ))
+)
+
+p_tf_upset
+
+file_tf_upset <- "TF_activity_counts_upset.pdf"
+ggsave(file.path(params$fig_dir, file_tf_upset), p_tf_upset, width = 7.2, height = 4)
+```
+
+## Figure 6I: IF/inflamma TFs
+
+```{r}
+library(dplyr); library(tidyr); library(tibble); library(ggplot2)
+
+tf_family_plot <- function(acts,
+                           families = c(Stat  = "^Stat",
+                                        Irf   = "^Irf",
+                                        Nfkb  = "^Nfkb",
+                                        Atf4  = "^Atf4$"),
+                           gate_contrasts = c("VEH_Tcells", "AZA_Tcells"),
+                           sig_cut = 0.05,
+                           title = NULL,
+                           subtitle = NULL
+                             ) {
+
+  ## --- assign each TF to a family (NA = no match) --------------------------
+  fam_of <- function(x) {
+    hit <- vapply(families, \(p) grepl(p, x), logical(1))
+    if (any(hit)) names(families)[which(hit)[1]] else NA_character_
+  }
+
+  acts_fam <- acts |>
+    mutate(family = vapply(source, fam_of, character(1))) |>
+    filter(!is.na(family))
+
+  ## --- gate: significant in >=1 of the T-cell arms -------------------------
+  keep <- acts_fam |>
+    filter(contrast %in% gate_contrasts, padj < sig_cut) |>
+    distinct(source) |>
+    pull(source)
+
+  acts_fam <- acts_fam |>
+    filter(source %in% keep) |>
+    mutate(family = factor(family, levels = names(families)))
+
+  if (nrow(acts_fam) == 0) {
+    message("No TFs from these families are significant in the gate contrasts.")
+    return(list(table = acts[0, ], plot = NULL))
+  }
+
+  ## --- row order: family, then score in the combined arm -------------------
+  ord <- acts_fam |>
+    filter(contrast == "AZA_Tcells") |>
+    arrange(family, score) |>
+    pull(source)
+
+  acts_fam$source <- gsub("_.*", "", acts_fam$source)
+
+  ord <- c(ord, setdiff(unique(acts_fam$source), ord))
+
+  acts_fam <- acts_fam |> mutate(source = factor(source, levels = ord))
+
+  ## --- table ---------------------------------------------------------------
+  tbl <- acts_fam |>
+    arrange(family, desc(source), contrast) |>
+    dplyr::select(family, source, DESCRIPTION, contrast, score, dir,
+                  p_value, padj, rank_padj, sig)
+
+  ## --- plot ----------------------------------------------------------------
+  p <- ggplot(acts_fam, aes(contrast, source)) +
+    geom_point(aes(size = pmin(-log10(padj), 6), fill = score, colour = sig),
+               shape = 21, stroke = 0.4) +
+    scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426",
+                         midpoint = 0, name = "TF enrichment\nscore") +
+    scale_colour_manual(values = c(`TRUE` = "grey15", `FALSE` = "grey80"),
+                        name = "FDR < 0.05", labels = c("no", "yes")) +
+    scale_size_continuous(range = c(1, 7), name ="FDR",
+                          breaks = c(1.3, 3, 6), labels = c("0.05", "0.001", "\u22641e-6")) +
+    facet_grid(family ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    labs(x = NULL, y = NULL, title = title, subtitle = subtitle) +
+    guides(colour = guide_legend(override.aes = list(size = 4, fill = "white"))) +
+    theme_bw(base_size = 16) +
+    theme(axis.text.x     = element_text(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          strip.text.y.left = element_text(angle = 0, face = "bold"),
+          strip.placement  = "outside")
+
+  list(table = tbl, plot = p)
+}
+```
+
+```{r fig.width=6.5, fig.height=5}
+tf_act$contrast <- factor(tf_act$contrast , levels = c("VEH", "AZA_Tcells"))
+fam <- tf_family_plot(tf_act)
+out <- fam$plot +
+  theme(
+    axis.text.y      = element_text(size = 16),
+    strip.text.y.left = element_text(size = 17, angle = 0, face = "bold")
+  ) +
+  theme(
+    axis.text.x      = element_text(size = 16)
+  ) +
+  scale_x_discrete(labels = c(
+    "VEH"        = "VEH",
+    "AZA_Tcells" = "AZA+T cells"
+  ))
+out
+
+file_tf_upset <- "TF_IFN_Infla_dotplot.pdf"
+ggsave(file.path(params$fig_dir, file_tf_upset), out, width = 6.5, height = 5)
+```
+
+## 6J : Volcano plot of gene statistics - Stat1.
+
+```{r}
+tf_name      <- "Stat1_chip"
+stat1_targets <- net %>%
+  as.data.frame() %>%
+  filter(source == tf_name) %>%
+  pull(target) %>%
+  unique()
+
+make_volcano_tf <- function(df, comparison_label, targets, tf_name,
+                            fdr_thresh = 0.05, fc_thresh = 0.5, fc_cap = 8) {
+
+  df <- as.data.frame(df) %>%
+    mutate(
+      neg_log10_fdr = -log10(FDR),
+      is_sig    = FDR < fdr_thresh & abs(logFC) >= fc_thresh,
+      is_target = Symbol %in% targets,
+      group = case_when(
+        is_target & is_sig ~ "Target_sig",
+        is_target          ~ "Target_ns",
+        is_sig             ~ "Other_sig",
+        TRUE               ~ "ns"
+      ),
+      group      = factor(group, levels = c("ns", "Other_sig", "Target_ns", "Target_sig")),
+      logFC_plot = pmax(pmin(logFC, fc_cap), -fc_cap)
+    )
+
+  n_t_sig <- sum(df$group == "Target_sig")
+  n_t_ns  <- sum(df$group == "Target_ns")
+  n_t_all <- n_t_sig + n_t_ns
+
+  cols   <- c("ns" = "grey75", "Other_sig" = "grey45",
+              "Target_ns" = "#F4B6AC",
+              "Target_sig" = "#D6604D")
+  sizes  <- c("ns" = 0.8, "Other_sig" = 1.2, "Target_ns" = 2.5, "Target_sig" = 3.0)
+  alphas <- c("ns" = 0.3, "Other_sig" = 0.5, "Target_ns" = 0.9, "Target_sig" = 0.95)
+
+  df <- df %>% arrange(group)
+
+  p <- ggplot(df, aes(x = logFC_plot, y = neg_log10_fdr,
+                      color = group, size = group, alpha = group)) +
+    geom_point(shape = 16) +
+    geom_hline(yintercept = -log10(fdr_thresh),
+               linetype = "dashed", linewidth = 0.4, color = "grey45") +
+    geom_vline(xintercept = c(-fc_thresh, fc_thresh),
+               linetype = "dashed", linewidth = 0.4, color = "grey45") +
+    scale_color_manual(
+      values = cols,
+      breaks = c("Target_sig", "Target_ns"),
+      labels = c(paste0(tf_name, " targets, significant (n = ", n_t_sig, ")"),
+                 paste0(tf_name, " targets, not significant (n = ", n_t_ns, ")"))
+    ) +
+    scale_size_manual(values = sizes, guide = "none") +
+    scale_alpha_manual(values = alphas, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.06))) +
+    labs(x = expression("Log"[2]*" fold change (KO vs CTRL)"),
+         y = expression("-log"[10]*"(FDR)")) +
+    theme_classic(base_size = 15) +
+    theme(
+      plot.title       = element_blank(),
+      plot.subtitle    = element_blank(),
+      axis.text        = element_text(size = 12, color = "grey20"),
+      axis.title       = element_text(size = 13),
+      legend.title     = element_blank(),
+      legend.text      = element_text(size = 11),
+      legend.key.size  = unit(0.8, "lines"),
+      panel.grid.major = element_line(color = "grey93", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      plot.margin      = margin(6, 10, 6, 6),
+      legend.position  = "right"
+    ) +
+    theme(legend.position = "top", legend.direction = "vertical") +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+
+  list(plot = p, n_targets = n_t_all)
+}
+```
+
+```{r fig.width=4.5, fig.height=3.5}
+comp <- "KO__vs__NTC_AZA_Tcells"
+v_stat1 <- make_volcano_tf(res[[comp]], comp, stat1_targets, tf_name,
+                           fdr_thresh = fdr_thresh, fc_thresh = fc_thresh)
+
+v_stat1$plot
+
+file_stat1 <- paste0("volcano_stat1_targets_", comp, ".pdf")
+ggsave(file.path(params$fig_dir, file_stat1), v_stat1$plot,
+       width = 4.5, height = 3.5)
+```
+
+## Heatmap of immune activation / inflammation genes
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+genes_hm <- c("Ccl2", "Ccl4", "Ccl7", "Ccl12", "Cybb",
+              "Cd40", "Cd80", "Cd86", "S100a8", "S100a9")
+
+gene_map <- as.data.frame(dge$genes) %>%
+  filter(Symbol %in% genes_hm) %>%
+  select(GENEID, Symbol)
+
+missing_genes <- setdiff(genes_hm, gene_map$Symbol)
+if (length(missing_genes) > 0)
+  message("Not found in data (dropped): ", paste(missing_genes, collapse = ", "))
+
+gene_map <- gene_map[match(intersect(genes_hm, gene_map$Symbol), gene_map$Symbol), ]
+
+grp_levels <- c("NTC_Vehicle", "KO_Vehicle", "NTC_AZA_Tcells", "KO_AZA_Tcells")
+grp_labels <- c("CTRL VEH", "KO VEH", "CTRL AZA+T cells", "KO AZA+T cells")
+
+samp <- as.data.frame(dge$samples)
+samp$group_label <- factor(
+  as.character(samp$SampleGroup),
+  levels = grp_levels, labels = grp_labels
+)
+
+samp_ord <- samp[order(samp$group_label), ]
+sample_ids <- rownames(samp_ord)
+
+mat <- log2cpm[gene_map$GENEID, sample_ids, drop = FALSE]
+rownames(mat) <- gene_map$Symbol
+
+mat_z <- t(scale(t(mat)))
+
+grp_cols <- c("CTRL VEH" = "#9ECAE1", "KO VEH" = "#3182BD",
+              "CTRL AZA+T cells"     = "#FCBBA1", "KO AZA+T cells" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+
+show_ns <- TRUE
+
+get_stat <- function(contrast) {
+  as.data.frame(res[[contrast]]) %>%
+    filter(Symbol %in% rownames(mat_z)) %>%
+    slice(match(rownames(mat_z), Symbol)) %>%
+    select(Symbol, logFC, FDR)
+}
+st_veh <- get_stat("KO__vs__NTC_Vehicle")
+st_aza <- get_stat("KO__vs__NTC_AZA_Tcells")
+
+sig_lab <- function(p) {
+  ifelse(is.na(p), "",
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01,  "**",
+  ifelse(p < 0.05,   "*", if (show_ns) "ns" else ""))))
+}
+
+m            <- max(abs(c(st_veh$logFC, st_aza$logFC)), na.rm = TRUE)
+col_fun_stat <- colorRamp2(c(-m, 0, m), c("#2166AC", "white", "#D6604D"))
+
+row_anno <- rowAnnotation(
+  `VEH` = anno_simple(
+    st_veh$logFC, col = col_fun_stat,
+    pch = sig_lab(st_veh$FDR),
+    pt_gp = gpar(fontsize = 12, fontface = "bold"),
+    na_col = "grey90", width = unit(6, "mm")
+  ),
+  `AZA+\nT cells` = anno_simple(
+    st_aza$logFC, col = col_fun_stat,
+    pch = sig_lab(st_aza$FDR),
+    pt_gp = gpar(fontsize = 12, fontface = "bold"),
+    na_col = "grey90", width = unit(6, "mm")
+  ),
+
+  spacer = anno_empty(width = unit(10, "mm"), border = FALSE),
+
+  annotation_name_gp     = gpar(fontsize = 12),
+  annotation_name_side   = "top",
+  annotation_name_rot    = 60,
+  annotation_name_offset = unit(2, "mm"),
+  show_annotation_name   = c(TRUE, TRUE, FALSE),
+  gap                    = unit(2, "mm")
+)
+
+stat_legend <- Legend(
+  col_fun = col_fun_stat,
+  title   = "log2FC\n(KO vs CTRL)",
+  direction = "vertical",
+  title_gp  = gpar(fontsize = 13, fontface = "bold"),
+  labels_gp = gpar(fontsize = 12)
+)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2CPM)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  right_annotation    = row_anno,
+  cluster_rows        = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 15, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+```
+
+```{r fig.width=7.1, fig.height=3.3}
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+
+file_hm <- "heatmap_immune_genes.pdf"
+pdf(file.path(params$fig_dir, file_hm), width = 7.1, height = 3.3)
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+dev.off()
+```
+
+## Heatmap `GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION_OF_EXOGENOUS_PEPTIDE_ANTIGEN_VIA_MHC_CLASS_II`
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+pw_name <- "GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION_OF_EXOGENOUS_PEPTIDE_ANTIGEN_VIA_MHC_CLASS_II"
+
+pw_ens <- unlist(gene_sets$ensembl[gene_sets$geneset_name == pw_name])
+pw_ens <- intersect(unique(pw_ens), rownames(log2cpm))
+
+message(length(pw_ens), " genes of the gene set found in log2cpm")
+
+gene_map <- as.data.frame(dge$genes) %>%
+  filter(GENEID %in% pw_ens) %>%
+  select(GENEID, Symbol)
+
+grp_levels <- c("NTC_Vehicle", "KO_Vehicle", "NTC_AZA_Tcells", "KO_AZA_Tcells")
+grp_labels <- c("CTRL VEH", "KO VEH", "CTRL AZA+T cells", "KO AZA+T cells")
+
+samp <- as.data.frame(dge$samples)
+samp$group_label <- factor(as.character(samp$SampleGroup),
+                           levels = grp_levels, labels = grp_labels)
+samp_ord   <- samp[order(samp$group_label), ]
+sample_ids <- rownames(samp_ord)
+
+mat <- log2cpm[gene_map$GENEID, sample_ids, drop = FALSE]
+rownames(mat) <- gene_map$Symbol
+mat <- mat[!duplicated(rownames(mat)), , drop = FALSE]
+
+mat <- mat[apply(mat, 1, sd) > 0, , drop = FALSE]
+mat_z <- t(scale(t(mat)))
+
+grp_cols <- c("CTRL VEH" = "#9ECAE1", "KO VEH" = "#3182BD",
+              "CTRL AZA+T cells" = "#FCBBA1", "KO AZA+T cells" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2CPM)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  cluster_rows        = TRUE,
+  show_row_dend       = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 14, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+```
+
+```{r fig.width=4.7, fig.height=4}
+draw(ht, merge_legend = TRUE)
+
+file_hm2 <- "heatmap_GOBP_MHCII_antigen_presentation.pdf"
+pdf(file.path(params$fig_dir,file_hm2), width = 4.7, height = 4)
+draw(ht, merge_legend = TRUE)
+dev.off()
+```
+
+## Heatmap `GOBP_ANTIGEN_PROCESSING_AND_PRESENTATION_OF_PEPTIDE_OR_POLYSACCHARIDE_ANTIGEN_VIA_MHC_CLASS_II`
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+genes_hm <- c("Ciita", "Cd74", "H2-Aa", "H2-Ab1", "H2-Ea",
+              "H2-Eb1", "H2-DMa", "H2-DMb1", "H2-DMb2")
+
+gene_map <- as.data.frame(dge$genes) %>%
+  filter(Symbol %in% genes_hm) %>%
+  select(GENEID, Symbol)
+
+missing_genes <- setdiff(genes_hm, gene_map$Symbol)
+if (length(missing_genes) > 0)
+  message("Not found in data (dropped): ", paste(missing_genes, collapse = ", "))
+
+gene_map <- gene_map[match(intersect(genes_hm, gene_map$Symbol), gene_map$Symbol), ]
+
+grp_levels <- c("NTC_AZA_Tcells", "KO_AZA_Tcells")
+grp_labels <- c("CTRL AZA+T cells", "KO AZA+T cells")
+
+samp <- as.data.frame(dge$samples)
+samp <- samp |>
+  filter(samp$SampleGroup %in% grp_levels)
+samp$group_label <- factor(as.character(samp$SampleGroup),
+                           levels = grp_levels, labels = grp_labels)
+samp_ord   <- samp[order(samp$group_label), ]
+sample_ids <- rownames(samp_ord)
+
+mat <- log2cpm[gene_map$GENEID, sample_ids, drop = FALSE]
+rownames(mat) <- gene_map$Symbol
+mat <- mat[!duplicated(rownames(mat)), , drop = FALSE]
+
+mat <- mat[apply(mat, 1, sd) > 0, , drop = FALSE]
+mat_z <- t(scale(t(mat)))
+
+grp_cols <- c("CTRL AZA+T cells" = "#FCBBA1", "KO AZA+T cells" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+show_ns <- TRUE
+
+st_aza <- as.data.frame(res[["KO__vs__NTC_AZA_Tcells"]]) %>%
+  filter(Symbol %in% rownames(mat_z)) %>%
+  slice(match(rownames(mat_z), Symbol)) %>%
+  select(Symbol, logFC, FDR)
+
+sig_lab <- function(p) {
+  ifelse(is.na(p), "",
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01,  "**",
+  ifelse(p < 0.05,   "*", if (show_ns) "ns" else ""))))
+}
+
+m            <- max(abs(st_aza$logFC), na.rm = TRUE)
+col_fun_stat <- colorRamp2(c(-m, 0, m), c("#2166AC", "white", "#D6604D"))
+
+row_anno <- rowAnnotation(
+  `AZA+Tc` = anno_simple(st_aza$logFC, col = col_fun_stat,
+                         pch = sig_lab(st_aza$FDR),
+                         pt_gp = gpar(fontsize = 12, fontface = "bold"),
+                         na_col = "grey90", width = unit(5, "mm")),
+  annotation_name_gp     = gpar(fontsize = 12),
+  show_annotation_name = FALSE,
+  annotation_name_side   = "top",
+  annotation_name_rot    = 90,
+  annotation_name_offset = unit(2, "mm")
+)
+
+stat_legend <- Legend(
+  col_fun = col_fun_stat,
+  title   = "log2FC\n(KO vs CTRL)",
+  direction = "vertical",
+  title_gp  = gpar(fontsize = 13, fontface = "bold"),
+  labels_gp = gpar(fontsize = 12)
+)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2CPM)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  right_annotation    = row_anno,
+  cluster_rows        = TRUE,
+  show_row_dend       = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 12, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+```
+
+```{r fig.width=6.4, fig.height=2.1}
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+
+file_hm2 <- "heatmap_MHCII_peptide_polysaccharide_antigen_presentation.pdf"
+pdf(file.path(params$fig_dir,file_hm2), width = 6.4, height = 2.1)
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+dev.off()
+```
+
+## NRF2 related data
+
+```{r}
+library(dplyr); library(tidyr); library(tibble); library(ggplot2); library(ggrepel)
+
+comp_r2    <- "KO__vs__NTC_AZA_Tcells"
+grp_levels <- c("NTC_Vehicle", "KO_Vehicle", "NTC_AZA_Tcells", "KO_AZA_Tcells")
+grp_labels <- c("CTRL,Vehicle", "KO,Vehicle", "CTRL,AZA+Tcells", "KO,AZA+Tcells")
+grp_cols   <- c("CTRL,Vehicle" = "#9ECAE1", "KO,Vehicle" = "#3182BD",
+                "CTRL,AZA+Tcells" = "#FCBBA1", "KO,AZA+Tcells" = "#CB181D")
+
+samp_df <- data.frame(
+  sample = rownames(dge$samples),
+  group  = factor(as.character(dge$samples$SampleGroup),
+                  levels = grp_levels, labels = grp_labels)
+)
+
+fmt_fdr <- function(p) ifelse(p < 0.001, formatC(p, format = "e", digits = 1),
+                              sprintf("%.3f", p))
+```
+
+```{r}
+core_genes   <- c("Nfe2l2", "Keap1")
+target_genes <- c("Hmox1", "Nqo1", "Gclc", "Gclm", "Txnrd1", "Slc7a11",
+                  "Gsr", "Prdx1", "Sqstm1", "Fth1", "Ftl1", "Slc40a1")
+
+make_expr_plot <- function(genes, ncol = 2) {
+  gm <- as.data.frame(dge$genes) %>%
+    filter(Symbol %in% genes) %>% distinct(Symbol, .keep_all = TRUE)
+  miss <- setdiff(genes, gm$Symbol)
+  if (length(miss)) message("Not in data (dropped): ", paste(miss, collapse = ", "))
+
+  stats <- as.data.frame(res[[comp_r2]]) %>%
+    filter(Symbol %in% gm$Symbol) %>%
+    transmute(Symbol,
+              gene_lab = sprintf("%s\nlog2FC = %.2f, FDR = %s", Symbol, logFC, fmt_fdr(FDR)))
+
+  long <- log2cpm[gm$GENEID, , drop = FALSE] %>%
+    as.data.frame() %>% rownames_to_column("GENEID") %>%
+    left_join(select(gm, GENEID, Symbol), by = "GENEID") %>%
+    pivot_longer(-c(GENEID, Symbol), names_to = "sample", values_to = "log2cpm") %>%
+    left_join(samp_df, by = "sample") %>%
+    left_join(stats, by = "Symbol") %>%
+    mutate(gene_lab = factor(gene_lab, levels = stats$gene_lab[match(genes, stats$Symbol)] %>% na.omit()))
+
+  ggplot(long, aes(group, log2cpm, fill = group, colour = group)) +
+    geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.55, linewidth = 0.4) +
+    geom_jitter(width = 0.12, size = 1.6, alpha = 0.7, shape = 16) +
+    facet_wrap(~ gene_lab, scales = "free_y", ncol = ncol) +
+    scale_fill_manual(values = grp_cols) + scale_colour_manual(values = grp_cols) +
+    labs(x = NULL, y = expression("log"[2]*"CPM")) +
+    theme_bw(base_size = 14) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(size = 12, angle = 30, hjust = 1, color = "black"),
+          axis.text.y = element_text(size = 12, color = "black"),
+          axis.title.y = element_text(size = 14),
+          strip.text = element_text(size = 11, face = "bold"),
+          strip.background = element_rect(fill = "grey94", color = NA),
+          panel.grid.minor = element_blank(), panel.grid.major.x = element_blank())
+}
+
+p_expr_core    <- make_expr_plot(core_genes, ncol = 2)
+p_expr_core
+
+f1 <- "NRF2_expression_core.pdf";    ggsave(file.path(params$fig_dir, f1), p_expr_core,    width = 12, height = 7)
+```
+
+# RMB IFNg (Run3)
+
+```{r}
+params$data <-  "../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/"
+
+dge     <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/rds/dge_object.rds")
+log2cpm <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/rds/log2cpm_normalized.rds")
+
+gene_sets <- readRDS(file.path(msigdb_dir, "msigdb_v2025.1.Mm_gene_sets.rds"))
+
+pca_res   <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/rds/shiny/rds/expression_set_pca.rds")
+
+fits <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/rds/shiny/rds/limma_results.rds")
+res <- list()
+res$KO__vs__CTRL_AZA_IFNg <- fread("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/tables/diffexp_KO__vs__CTRL_AZA_IFNg.txt")
+
+gsea_res_dfr <- readxl::read_excel("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/tables/gsea_sig.xlsx")
+sig  <- subset(gsea_res_dfr, FDR < 0.05)
+cols <- c("MsigDb", "Contrast", "Pathway", "NGenes", "FractionOverlap", "Direction",
+          "absLog2FC", "PValue", "FDR")
+sig  <- sig[, intersect(cols, names(sig)), drop = FALSE]
+
+tf_act <- fread("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/results/tables/TF_activity_TF_activity_all.csv")
+net <- readRDS("../../mrnaseq_rmb1_slc6a8_ko_aza_ifng/data/collectri_mouse_stat1Extended.rds")
+
+contrasts <- sort(unique(sig$Contrast))
+msigdbs   <- sort(unique(sig$MsigDb))
+```
+
+## Figure 7B: volcano plot SLC6A8-KO vs. CTRL,
+
+```{r fig.width=3.5, fig.height=2.5}
+comp_r3 <- "KO__vs__CTRL_AZA_IFNg"
+
+vol_r3 <- make_volcano(res[[comp_r3]], comparison_label = comp_r3,
+                       fdr_thresh = 0.05, fc_thresh = 0.5)
+
+vol_r3$plot
+
+file_vol_r3 <- paste0("volcano_", comp_r3, ".pdf")
+
+ggsave(
+  filename = file.path(params$fig_dir, file_vol_r3),
+  plot     = vol_r3$plot,
+  width    = 3.5, height = 2.5
+)
+```
+
+## Figure 6C : Lollipop plot top 5 and bottom 5 Hallmark Pathways
+
+```{r fig.width=7, fig.height=4.7}
+comp_r3 <- "KO__vs__CTRL_AZA_IFNg"
+
+hm_r3 <- make_hallmark_lollipop(comp_r3, gsea_res_dfr,
+                                fdr_thresh = fdr_thresh_path, n_top = n_top)
+
+hm_r3$plot
+
+file_hm_r3 <- paste0("hallmark_lollipop_", comp_r3, ".pdf")
+ggsave(file.path(params$fig_dir, file_hm_r3),
+       hm_r3$plot, width = 7, height = 4.7)
+```
+
+## Figure 6D D:Heatmap for Ccl2, Ccl4, Ccl7, Ccl12, Cybb, CD40, CD80, CD86, S100a8, S100a9
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+genes_hm <- c("Ccl2", "Ccl4", "Ccl7", "Ccl12", "Cybb",
+              "Cd40", "Cd80", "Cd86", "S100a8", "S100a9")
+
+gene_map <- as.data.frame(dge$genes) %>%
+  filter(Symbol %in% genes_hm) %>%
+  select(GENEID, Symbol)
+
+missing_genes <- setdiff(genes_hm, gene_map$Symbol)
+if (length(missing_genes) > 0)
+  message("Not found in data (dropped): ", paste(missing_genes, collapse = ", "))
+
+gene_map <- gene_map[match(intersect(genes_hm, gene_map$Symbol), gene_map$Symbol), ]
+
+grp_levels <- c("CTRL_AZA_IFNg", "KO_AZA_IFNg")
+grp_labels <- c("CTRL AZA+IFNg", "KO AZA+IFNg")
+
+samp <- as.data.frame(dge$samples)
+samp$group_label <- factor(as.character(samp$SampleGroup),
+                           levels = grp_levels, labels = grp_labels)
+
+samp_ord   <- samp[order(samp$group_label), ]
+sample_ids <- rownames(samp_ord)
+
+mat <- log2cpm[gene_map$GENEID, sample_ids, drop = FALSE]
+rownames(mat) <- gene_map$Symbol
+mat_z <- t(scale(t(mat)))
+
+grp_cols <- c("CTRL AZA+IFNg" = "#FCBBA1", "KO AZA+IFNg" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+
+show_ns <- TRUE
+
+st_r3 <- as.data.frame(res[["KO__vs__CTRL_AZA_IFNg"]]) %>%
+  filter(Symbol %in% rownames(mat_z)) %>%
+  slice(match(rownames(mat_z), Symbol)) %>%
+  select(Symbol, logFC, FDR)
+
+sig_lab <- function(p) {
+  ifelse(is.na(p), "",
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01,  "**",
+  ifelse(p < 0.05,   "*", if (show_ns) "ns" else ""))))
+}
+
+m            <- max(abs(st_r3$logFC), na.rm = TRUE)
+col_fun_stat <- colorRamp2(c(-m, 0, m), c("#2166AC", "white", "#D6604D"))
+
+row_anno <- rowAnnotation(
+  stat = anno_simple(st_r3$logFC, col = col_fun_stat,
+                     pch = sig_lab(st_r3$FDR),
+                     pt_gp = gpar(fontsize = 12, fontface = "bold"),
+                     na_col = "grey90", width = unit(8, "mm")),
+  show_annotation_name = FALSE
+)
+
+stat_legend <- Legend(
+  col_fun   = col_fun_stat,
+  title     = "log2FC\n(KO vs CTRL)",
+  direction = "vertical",
+  title_gp  = gpar(fontsize = 13, fontface = "bold"),
+  labels_gp = gpar(fontsize = 12)
+)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2CPM)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  right_annotation    = row_anno,
+  cluster_rows        = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 15, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+```
+
+```{r fig.width=6.5,fig.height=3.3}
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+
+file_hm_r3 <- "heatmap_inflammatory_genes_AZA_IFNg.pdf"
+pdf(file.path(params$fig_dir, file_hm_r3), width = 6.5, height = 3.3)
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+dev.off()
+```
+
+## Fig 6E :
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+genes_hm <- c("Ciita", "H2-DMa", "H2-Ea", "H2-Ab1", "H2-DMb2", "H2-DMb1", "H2-Aa", "Cd74", "H2-Eb1")
+
+gene_map <- as.data.frame(dge$genes) %>%
+  filter(Symbol %in% genes_hm) %>%
+  select(GENEID, Symbol) %>%
+  distinct(Symbol, .keep_all = TRUE)
+
+missing_genes <- setdiff(genes_hm, gene_map$Symbol)
+if (length(missing_genes) > 0)
+  message("Not found in data (dropped): ", paste(missing_genes, collapse = ", "))
+
+gene_map <- gene_map[match(intersect(genes_hm, gene_map$Symbol), gene_map$Symbol), ]
+
+grp_levels <- c("CTRL_AZA_IFNg", "KO_AZA_IFNg")
+grp_labels <- c("CTRL AZA+IFNg", "KO AZA+IFNg")
+
+samp <- as.data.frame(dge$samples)
+samp$group_label <- factor(as.character(samp$SampleGroup),
+                           levels = grp_levels, labels = grp_labels)
+
+samp_ord   <- samp[order(samp$group_label), ]
+sample_ids <- rownames(samp_ord)
+
+mat <- log2cpm[gene_map$GENEID, sample_ids, drop = FALSE]
+rownames(mat) <- gene_map$Symbol
+
+mat <- mat[apply(mat, 1, sd) > 0, , drop = FALSE]
+mat_z <- t(scale(t(mat)))
+
+grp_cols <- c("CTRL AZA+IFNg" = "#FCBBA1", "KO AZA+IFNg" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+
+show_ns <- TRUE
+
+st_r3 <- as.data.frame(res[["KO__vs__CTRL_AZA_IFNg"]]) %>%
+  filter(Symbol %in% rownames(mat_z)) %>%
+  slice(match(rownames(mat_z), Symbol)) %>%
+  select(Symbol, logFC, FDR)
+
+sig_lab <- function(p) {
+  ifelse(is.na(p), "",
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01,  "**",
+  ifelse(p < 0.05,   "*", if (show_ns) "ns" else ""))))
+}
+
+m            <- max(abs(st_r3$logFC), na.rm = TRUE)
+col_fun_stat <- colorRamp2(c(-m, 0, m), c("#2166AC", "white", "#D6604D"))
+
+row_anno <- rowAnnotation(
+  stat = anno_simple(st_r3$logFC, col = col_fun_stat,
+                     pch = sig_lab(st_r3$FDR),
+                     pt_gp = gpar(fontsize = 12, fontface = "bold"),
+                     na_col = "grey90", width = unit(8, "mm")),
+  show_annotation_name = FALSE
+)
+
+stat_legend <- Legend(
+  col_fun   = col_fun_stat,
+  title     = "log2FC\n(KO vs CTRL)",
+  direction = "vertical",
+  title_gp  = gpar(fontsize = 13, fontface = "bold"),
+  labels_gp = gpar(fontsize = 12)
+)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2CPM)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  right_annotation    = row_anno,
+  cluster_rows        = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 15, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+```
+
+```{r  fig.width=6.5,fig.height=3.3}
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+
+file_hm_r3b <- "heatmap_MHCII_genes_AZA_IFNg.pdf"
+pdf(file.path(params$fig, file_hm_r3b), width = 6.5, height = 3.3)
+draw(ht, merge_legend = TRUE,
+     heatmap_legend_side    = "right",
+     annotation_legend_side = "right",
+     annotation_legend_list = list(stat_legend),
+     padding = unit(c(2, 2, 2, 2), "mm"),
+     ht_gap  = unit(8, "mm"))
+dev.off()
+```
+
+## Fig 7F Correlation plot
+
+```{r}
+res_run2 <- fread("../../mrnaseq_rmb1_slc6a8_ko_run2/results/tables/diffexp_KO__vs__NTC_AZA_Tcells.txt")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+r3 <- as.data.frame(res[["KO__vs__CTRL_AZA_IFNg"]]) %>%
+  select(GENEID, Symbol, logFC_r3 = logFC)
+
+r2 <- as.data.frame(res_run2) %>%
+  select(GENEID, logFC_r2 = logFC)
+
+cor_df <- inner_join(r3, r2, by = "GENEID") %>%
+  filter(!is.na(logFC_r3), !is.na(logFC_r2))
+
+ct    <- cor.test(cor_df$logFC_r2, cor_df$logFC_r3,
+                  method = "spearman", exact = FALSE)
+rho   <- unname(ct$estimate)
+p_val <- ct$p.value
+
+format_pval_safe <- function(p, floor_p = 1e-300) {
+  if (is.na(p) || p < floor_p) {
+    "  p < 1e-300"
+  } else if  (p < 0.001) {
+    paste0("  p = ", formatC(p, format = "e", digits = 1))
+  } else {
+    sprintf("  p = %.3f", p)
+  }
+}
+
+ann_label <- paste0("Spearman r = ", sprintf("%.2f", rho), "\n",
+                    format_pval_safe(p_val))
+
+ax_lim <- max(abs(c(cor_df$logFC_r2, cor_df$logFC_r3))) * 1.05
+
+p_cor <- ggplot(cor_df, aes(x = logFC_r2, y = logFC_r3)) +
+  geom_hline(yintercept = 0, color = "grey80", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey80", linewidth = 0.5) +
+  geom_point(alpha = 0.25, size = 3, color = "#2C7BB6", shape = 16) +
+  annotate("text", x = -Inf, y = Inf, label = ann_label,
+           hjust = -0.1, vjust = 1.3,
+           size = 5.5, color = "black", lineheight = 1.2) +
+  labs(
+    x = expression("logFC(KO vs CTRL, AZA + T cells)"),
+    y = expression("logFC(KO vs CTRL, AZA + IFN-"*gamma*")")
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+    axis.text          = element_text(size = 13, color = "black"),
+    axis.title         = element_text(size = 14),
+    panel.grid.major   = element_line(color = "grey93", linewidth = 0.3),
+    plot.margin        = margin(6, 10, 6, 6)
+  )
+```
+
+```{r fig.width=4, fig.height=3.5}
+p_cor
+
+file_cor <- "correlation_logFC_run2_vs_run3.pdf"
+ggsave(file.path(params$fig_dir, file_cor), p_cor, width = 4, height = 3.5)
+```
+
+```{r}
+library(grid)
+```
+
+# RMb1 run 1 (supplementary)
+
+```{r}
+params$data <-  "../../mrnaseq_rmb1_slc6a8_ko/results/"
+
+dge     <- readRDS("../../mrnaseq_rmb1_slc6a8_ko/results/rds/dge_object.rds")
+log2cpm <- readRDS("../../mrnaseq_rmb1_slc6a8_ko/results/rds/log2cpm_normalized.rds")
+
+gene_sets <- readRDS(file.path(msigdb_dir, "msigdb_v2025.1.Mm_gene_sets.rds"))
+
+pca_res   <- readRDS("../../mrnaseq_rmb1_slc6a8_ko/results/rds/shiny/rds/expression_set_pca.rds")
+
+fits <- readRDS("../../mrnaseq_rmb1_slc6a8_ko/results/rds/shiny/rds/limma_results.rds")
+res <- list()
+res$KO__vs__NTC_AZA_Tcells <- fread("../../mrnaseq_rmb1_slc6a8_ko/results/tables/diffexp_KO__vs__Control_AZA_Tcells.txt")
+
+gsea_res_dfr <- readxl::read_excel("../../mrnaseq_rmb1_slc6a8_ko/results/tables/gsea_sig.xlsx")
+sig  <- subset(gsea_res_dfr, FDR < 0.05)
+cols <- c("MsigDb", "Contrast", "Pathway", "NGenes", "FractionOverlap", "Direction",
+          "absLog2FC", "PValue", "FDR")
+sig  <- sig[, intersect(cols, names(sig)), drop = FALSE]
+
+tf_act <- fread("../../mrnaseq_rmb1_slc6a8_ko/results/tables/TF_activity_TF_activity_all.csv")
+net <- readRDS("../../mrnaseq_rmb1_slc6a8_ko/data/collectri_mouse_stat1Extended.rds")
+
+contrasts <- sort(unique(sig$Contrast))
+msigdbs   <- sort(unique(sig$MsigDb))
+```
+
+## Supp fig ? :Heatmap for Ccl2, Ccl4, Ccl7, Ccl12, Cybb, CD40, CD80, CD86, S100a8, S100a9
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+genes_hm <- c("Ccl2", "Ccl4", "Ccl7", "Ccl12", "Cybb",
+              "Cd40", "Cd80", "Cd86", "S100a8", "S100a9")
+
+gene_map <- as.data.frame(dge$genes) %>%
+  filter(Symbol %in% genes_hm) %>%
+  select(GENEID, Symbol) %>%
+  distinct(Symbol, .keep_all = TRUE)
+
+missing_genes <- setdiff(genes_hm, gene_map$Symbol)
+if (length(missing_genes) > 0)
+  message("Not found in data (dropped): ", paste(missing_genes, collapse = ", "))
+
+gene_map <- gene_map[match(intersect(genes_hm, gene_map$Symbol), gene_map$Symbol), ]
+
+grp_levels <- c("Control_Vehicle", "KO_Vehicle",
+                "Control_Tcells",  "KO_Tcells",
+                "Control_AZA",     "KO_AZA",
+                "Control_AZA_Tcells", "KO_AZA_Tcells")
+grp_labels <- c("CTRL Vehicle",   "KO Vehicle",
+                "CTRL Tcells",    "KO Tcells",
+                "CTRL AZA",       "KO AZA",
+                "CTRL AZA+Tcells","KO AZA+Tcells")
+
+samp <- as.data.frame(dge$samples)
+samp$group_label <- factor(as.character(samp$SampleGroup),
+                           levels = grp_levels, labels = grp_labels)
+
+samp_ord   <- samp[order(samp$group_label), ]
+sample_ids <- rownames(samp_ord)
+
+mat <- log2cpm[gene_map$GENEID, sample_ids, drop = FALSE]
+rownames(mat) <- gene_map$Symbol
+
+mat <- mat[apply(mat, 1, sd) > 0, , drop = FALSE]
+mat_z <- t(scale(t(mat)))
+
+grp_cols <- c("CTRL Vehicle"    = "#C6DBEF", "KO Vehicle"    = "#3182BD",
+              "CTRL Tcells"     = "#C7E9C0", "KO Tcells"     = "#31A354",
+              "CTRL AZA"        = "#FDD0A2", "KO AZA"        = "#E6550D",
+              "CTRL AZA+Tcells" = "#FCBBA1", "KO AZA+Tcells" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2CPM)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  cluster_rows        = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 13, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+```
+
+```{r fig.width=7.5,fig.height=3}
+draw(ht, merge_legend = TRUE)
+
+file_hm_r1 <- "heatmap_inflammatory_genes_Run1_8groups.pdf"
+pdf(file.path(params$fig_dir, file_hm_r1), width = 7.5, height = 3)
+draw(ht, merge_legend = TRUE)
+dev.off()
+```
+
+## Figure - TFs activation/repression
+
+```{r  fig.width=5.5, fig.height=3.2}
+library(dplyr); library(tidyr); library(ggplot2); library(ComplexUpset)
+
+ctr_levels <- c("VEH", "VEH_Tcells", "AZA", "AZA_Tcells")
+ctr_labels <- c("Vehicle", "T cells", "AZA", "AZA+T cells")
+trt_cols   <- setNames(c("#3182BD", "#31A354", "#E6550D", "#CB181D"), ctr_labels)
+dir_cols   <- c("Activated" = "#D6604D", "Repressed" = "#4393C3")
+
+tf_sig <- tf_act %>%
+  as.data.frame() %>%
+  filter(sig) %>%
+  mutate(
+    dir_short = ifelse(dir == "Activated in KO", "Activated", "Repressed"),
+    treatment = factor(contrast, levels = ctr_levels, labels = ctr_labels)
+  )
+
+tf_counts <- tf_sig %>%
+  mutate(dir = factor(dir, levels = c("Activated in KO", "Repressed in KO"))) %>%
+  count(treatment, dir, name = "n_tf") %>%
+  tidyr::complete(treatment, dir, fill = list(n_tf = 0))
+
+pub_tf_theme <- theme_bw(base_size = 14) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+    axis.text          = element_text(size = 13, color = "black"),
+    axis.text.x        = element_text(size = 13, angle = 30, hjust = 1),
+    axis.title.y       = element_text(size = 14),
+    axis.title.x       = element_blank(),
+    legend.position    = "none",
+    strip.text         = element_text(size = 14, face = "bold"),
+    strip.background   = element_rect(fill = "grey94", color = NA),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.margin        = margin(6, 10, 6, 6)
+  )
+
+p_tf <- ggplot(tf_counts, aes(treatment, n_tf, color = treatment)) +
+  geom_segment(aes(xend = treatment, y = 0, yend = n_tf), linewidth = 1.2) +
+  geom_point(size = 5) +
+  geom_text(aes(label = n_tf), vjust = -1.1, size = 5, fontface = "bold",
+            show.legend = FALSE) +
+  facet_wrap(~ dir, scales = "free_y", nrow = 1) +
+  scale_color_manual(values = trt_cols) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(y = "N. TFs (FDR < 0.05)") +
+  pub_tf_theme
+p_tf
+
+file_name_tf <- "TF_activity_counts_lollipop_run1.pdf"
+ggsave(file.path(params$fig_dir, file_name_tf), p_tf, width = 5.5, height = 3.2)
+```
+
+```{r fig.width=5.5, fig.height=3}
+tf_counts_bar <- tf_sig %>%
+  mutate(dir_short = factor(dir_short, levels = c("Activated", "Repressed"))) %>%
+  count(treatment, dir_short, name = "n_tf") %>%
+  tidyr::complete(treatment, dir_short, fill = list(n_tf = 0))
+
+p_tf_bar <- ggplot(tf_counts_bar, aes(treatment, n_tf, fill = dir_short)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65, alpha = 0.9) +
+  geom_text(aes(label = n_tf), position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 5, fontface = "bold", color = "grey20") +
+  scale_fill_manual(values = dir_cols, name = NULL,
+                    labels = c("Activated in KO", "Repressed in KO")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "N. TFs (FDR < 0.05)") +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title         = element_blank(),
+    plot.subtitle      = element_blank(),
+    axis.text          = element_text(size = 13, color = "black"),
+    axis.title.y       = element_text(size = 14),
+    legend.text        = element_text(size = 13),
+    legend.position    = "top",
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    plot.margin        = margin(6, 10, 6, 6)
+  )
+p_tf_bar
+
+file_tf_bar <- "TF_activity_counts_bars_run1.pdf"
+ggsave(file.path(params$fig_dir, file_tf_bar), p_tf_bar, width = 5.5, height = 3)
+```
+
+```{r fig.width=7.2, fig.height=4.7}
+set_levels <- as.vector(outer(c("Activated", "Repressed"), ctr_labels,
+                              \(d, t) paste0(d, " (", t, ")")))
+set_levels <- c(grep("^Activated", set_levels, value = TRUE),
+                grep("^Repressed", set_levels, value = TRUE))
+
+tf_sig <- tf_sig %>% mutate(set = paste0(dir_short, " (", treatment, ")"))
+
+tf_wide <- tf_sig %>%
+  distinct(source, set) %>%
+  mutate(member = TRUE) %>%
+  tidyr::pivot_wider(names_from = set, values_from = member, values_fill = FALSE) %>%
+  as.data.frame()
+for (s in set_levels) if (!s %in% names(tf_wide)) tf_wide[[s]] <- FALSE
+
+set_queries <- lapply(set_levels, function(s)
+  upset_query(set = s, fill = ifelse(grepl("^Activated", s), "#D6604D", "#4393C3")))
+
+p_tf_upset <- ComplexUpset::upset(
+  tf_wide,
+  intersect   = set_levels,
+  name        = NULL,
+  min_size    = 2,
+  width_ratio = 0.3,
+  sort_sets   = FALSE,
+  sort_intersections_by = "cardinality",
+  queries     = set_queries,
+  base_annotations = list(
+    "Number of TFs" = intersection_size(
+      counts = TRUE, text = list(size = 4.5), mapping = aes(fill = "bar")
+    ) +
+      scale_fill_manual(values = c("bar" = "grey30"), guide = "none") +
+      ylab("")
+  ),
+  set_sizes = upset_set_size() + ylab("N. TFs (FDR<0.05)"),
+  themes = upset_modify_themes(list(
+    "intersections_matrix" = theme(text = element_text(size = 13),
+                                   axis.text.y = element_text(size = 12, color = "black")),
+    "overall_sizes"        = theme(text = element_text(size = 13),
+                                   axis.text.x = element_text(size = 11)),
+    "Number of TFs"        = theme(
+      text         = element_text(size = 14),
+      axis.text.y  = element_text(size = 13, color = "black"),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_text(vjust = 4)
+    )
+  ))
+)
+p_tf_upset
+
+file_tf_upset <- "TF_activity_counts_upset_run1.pdf"
+ggsave(file.path(params$fig_dir, file_tf_upset), p_tf_upset, width = 7.2, height = 4.7)
+```
+
+## Figure  IF/inflamma TFs
+
+```{r}
+tf_family_plot <- function(acts,
+                           families = c(Stat = "^Stat", Irf = "^Irf",
+                                        Nfkb = "^Nfkb", Atf4 = "^Atf4$"),
+                           gate_contrasts = c("VEH_Tcells", "AZA_Tcells"),
+                           order_contrast = "AZA_Tcells",
+                           sig_cut = 0.05) {
+
+  fam_of <- function(x) {
+    hit <- vapply(families, \(p) grepl(p, x), logical(1))
+    if (any(hit)) names(families)[which(hit)[1]] else NA_character_
+  }
+
+  acts_fam <- acts |>
+    mutate(family = vapply(source, fam_of, character(1))) |>
+    filter(!is.na(family))
+
+  keep <- acts_fam |>
+    filter(contrast %in% gate_contrasts, padj < sig_cut) |>
+    distinct(source) |> pull(source)
+
+  acts_fam <- acts_fam |>
+    filter(source %in% keep) |>
+    mutate(family = factor(family, levels = names(families)))
+
+  if (nrow(acts_fam) == 0) {
+    message("No TFs from these families are significant in the gate contrasts.")
+    return(list(table = acts[0, ], plot = NULL))
+  }
+
+  acts_fam$source <- gsub("_.*", "", acts_fam$source)
+
+  ord <- acts_fam |>
+    filter(contrast == order_contrast) |>
+    arrange(family, score) |>
+    pull(source) |> unique()
+  ord <- c(ord, setdiff(unique(acts_fam$source), ord))
+  acts_fam <- acts_fam |> mutate(source = factor(source, levels = ord))
+
+  tbl <- acts_fam |>
+    arrange(family, desc(source), contrast) |>
+    dplyr::select(family, source, DESCRIPTION, contrast, score, dir,
+                  p_value, padj, rank_padj, sig)
+
+  p <- ggplot(acts_fam, aes(contrast, source)) +
+    geom_point(aes(size = pmin(-log10(padj), 6), fill = score, colour = sig),
+               shape = 21, stroke = 0.4) +
+    scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426",
+                         midpoint = 0, name = "TF enrichment\nscore") +
+    scale_colour_manual(values = c(`TRUE` = "grey15", `FALSE` = "grey80"),
+                        name = "FDR < 0.05", labels = c("no", "yes")) +
+    scale_size_continuous(range = c(1, 7), name = "FDR",
+                          breaks = c(1.3, 3, 6),
+                          labels = c("0.05", "0.001", "\u22641e-6")) +
+    facet_grid(family ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    labs(x = NULL, y = NULL) +
+    guides(colour = guide_legend(override.aes = list(size = 4, fill = "white"))) +
+    theme_bw(base_size = 16) +
+    theme(panel.grid.minor    = element_blank(),
+          strip.background    = element_blank(),
+          strip.text.y.left   = element_text(angle = 0, face = "bold"),
+          strip.placement     = "outside")
+
+  list(table = tbl, plot = p)
+}
+
+tf_act$contrast <- factor(tf_act$contrast, levels = ctr_levels)
+fam <- tf_family_plot(tf_act)
+
+out <- fam$plot +
+  scale_x_discrete(labels = setNames(ctr_labels, ctr_levels)) +
+  theme(
+    axis.text.y       = element_text(size = 16),
+    axis.text.x       = element_text(size = 16, angle = 30, hjust = 1),
+    strip.text.y.left = element_text(size = 17, angle = 0, face = "bold")
+  )
+```
+
+```{r fig.width=6.5, fig.height=5.5}
+out
+
+file_tf_dot <- "TF_IFN_Infla_dotplot_run1.pdf"
+ggsave(file.path(params$fig_dir, file_tf_dot), out, width = 6.5, height = 5.5)
+```
+
+## Volcano plot of gene statistics - Stat1.
+
+```{r}
+tf_name      <- "Stat1_chip"
+stat1_targets <- net %>%
+  as.data.frame() %>%
+  filter(source == tf_name) %>%
+  pull(target) %>%
+  unique()
+```
+
+```{r fig.width=4.5, fig.height=3.5}
+comp <- "KO__vs__NTC_AZA_Tcells"
+v_stat1 <- make_volcano_tf(res[[comp]], comp, stat1_targets, tf_name,
+                           fdr_thresh = fdr_thresh, fc_thresh = fc_thresh)
+
+v_stat1$plot
+
+file_stat1 <- paste0("volcano_stat1_targets_run1.pdf")
+ggsave(file.path(params$fig_dir, file_stat1), v_stat1$plot,
+       width = 4.5, height = 3.5)
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

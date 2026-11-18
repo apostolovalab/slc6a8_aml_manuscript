@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the article and this software record."
+title: "Analysis code for: The creatine transporter SLC6A8 is an immune pressure-exposed metabolic vulnerability in acute myeloid leukemia"
+type: software
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/apostolovalab/slc6a8_aml_manuscript"
+authors:
+  - family-names: Sonrel
+    given-names: Anthony
+    affiliation: "University Hospital of Basel"
+keywords:
+  - acute myeloid leukemia
+  - SLC6A8
+  - creatine
+  - RMB-1

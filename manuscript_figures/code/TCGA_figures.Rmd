@@ -1,0 +1,593 @@
+---
+title: " TCGA-related figures"
+subtitle: "Creatine Manuscript"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  interactive = TRUE,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  fig_dir = "../results/figures/TCGA/"
+)
+
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir)
+
+# Load packages ----------------------------------------------------------------
+library(BiocParallel)
+library(yaml)
+library(DT)
+library(writexl)
+library(edgeR)
+library(limma)
+library(unikn)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(pheatmap)
+library(RColorBrewer)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(forcats)
+library(ggpointdensity)
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+
+de_table_cols <- c(
+  "ENTREZID", "GENEID", "SYMBOL", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+format_pval_plain <- function(p) {
+  if (p < 0.001) {
+    exp <- floor(log10(p))
+    paste0("p < 1e", exp)
+  } else {
+    sprintf("p = %.3f", p)
+  }
+}
+```
+
+# TCGA
+
+```{r}
+## SLC6A8 CONTINUOUS PREDICTOR - **NOT** ERYTH CORRECTED -------
+
+dge     <- readRDS("../../tcga_slc6a8_rnaseq//results/rds_slc6a8_continuous//expression_set.rds")
+log2cpm <- readRDS("../../tcga_slc6a8_rnaseq/results/rds_slc6a8_continuous/expression_set_normalized.rds")
+
+rownames(dge$counts) <- dge$genes$Symbol
+
+pca_res   <- readRDS("../../tcga_slc6a8_rnaseq/results/rds_slc6a8_continuous/pca.rds")
+
+fits <- readRDS("../../tcga_slc6a8_rnaseq/results/rds_slc6a8_continuous/limma_results.rds")
+res  <- fread("../../tcga_slc6a8_rnaseq/results/tables_slc6a8_continuous/diffexp_SLC6A8.txt")
+
+gsea_res_dfr <- readxl::read_excel("../../tcga_slc6a8_rnaseq/results/tables_slc6a8_continuous/gsea_sig.xlsx")
+
+erythroid_scores <- fread("../../tcga_slc6a8_rnaseq/results/tables_slc6a8_continuous/erythroid_scores.txt") %>% as.data.frame()
+```
+
+## Supplementary Figure S14 A: Volcano plot
+
+```{r}
+library(readxl)
+eryth_human_pang <- fread("../../beataml2_rnaseq/data/PanglaoDB_markers_27_Mar_2020.tsv") %>%
+  as.data.frame() %>%
+  filter(`cell type` == "Erythroid-like and erythroid precursor cells") %>%
+  filter(
+    grepl("Hs", species),
+    !grepl("^HBB-|^HBA-|^HBB-B|^HBA-X", `official gene symbol`),
+    sensitivity_human > 0 | `canonical marker` == 1
+  ) %>%
+  dplyr::rename(Symbol = `official gene symbol`) %>%
+  arrange(desc(sensitivity_human)) %>%
+  distinct(Symbol, .keep_all = TRUE)
+
+eryth_cm <- read_excel("../../beataml2_rnaseq/data/Cell_marker_Human.xlsx") %>%
+  as.data.frame() %>%
+  dplyr::filter(grepl("erythroid", cell_name, ignore.case = TRUE)) %>%
+  dplyr::filter(tissue_class %in% c("Blood", "Bone marrow"))
+eryth_cm$Symbol[is.na(eryth_cm$Symbol)]  <- toupper(eryth_cm$marker)[is.na(eryth_cm$Symbol)]
+
+panglao_clean <- eryth_human_pang %>%
+  dplyr::select(
+    Symbol,
+    cell_type  = `cell type`,
+    sensitivity_human,
+    specificity_human,
+    canonical_marker = `canonical marker`,
+    ubiquitousness   = `ubiquitousness index`
+  ) %>%
+  mutate(
+    source     = "PanglaoDB",
+    cell_type  = "Erythroid-like and erythroid precursor cells"
+  ) %>%
+  filter(!is.na(Symbol), Symbol != "")
+
+cellmarker_clean <- eryth_cm %>%
+  filter(
+    species == "Human",
+    !is.na(Symbol),
+    Symbol != "",
+    Symbol != "<NA>"
+  ) %>%
+  dplyr::select(
+    Symbol,
+    cell_type = cell_name
+  ) %>%
+  mutate(
+    source           = "CellMarker2",
+    sensitivity_human = NA_real_,
+    specificity_human = NA_real_,
+    canonical_marker  = NA_real_,
+    ubiquitousness    = NA_real_
+  ) %>%
+  distinct()
+
+eryth_combined <- bind_rows(panglao_clean, cellmarker_clean) %>%
+  group_by(Symbol) %>%
+  mutate(
+    n_sources    = n_distinct(source),
+    in_both      = n_sources > 1,
+    sources_list = paste(sort(unique(source)), collapse = " + ")
+  ) %>%
+  ungroup() %>%
+  group_by(Symbol) %>%
+  dplyr::summarise(
+    cell_types       = paste(unique(cell_type), collapse = " | "),
+    sources_list     = dplyr::first(sources_list),
+    in_both          = dplyr::first(in_both),
+    n_sources        = dplyr::first(n_sources),
+    sensitivity_human = max(sensitivity_human, na.rm = TRUE),
+    specificity_human = max(specificity_human, na.rm = TRUE),
+    canonical_marker  = max(canonical_marker,  na.rm = TRUE),
+    ubiquitousness    = max(ubiquitousness,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.infinite(.x), NA_real_, .x))) %>%
+  arrange(desc(in_both), desc(sensitivity_human)) %>%
+  mutate(
+    cell_types_grouped= case_when(
+      str_detect(cell_types, regex("CD34\\+|megakaryocyte-erythroid", ignore_case = TRUE)) ~
+        "CD34+/MEP erythroid progenitor",
+
+      str_detect(cell_types, regex("erythroid-like|precursor|progenitor|immature", ignore_case = TRUE)) ~
+        "Erythroid precursor / immature",
+
+      str_detect(cell_types, regex("erythroid cell", ignore_case = TRUE)) ~
+        "Erythroid cell",
+
+      TRUE ~ "Other"
+    ),
+    cell_types_grouped = factor(
+      cell_types_grouped
+    )
+  ) %>%
+  relocate(cell_types_grouped, .after = cell_types)
+
+num_cols <- names(eryth_combined)[vapply(eryth_combined, is.numeric, logical(1))]
+
+eryth_de_combined <- res %>%
+  inner_join(
+    eryth_combined %>%
+      dplyr::select(Symbol, cell_types, cell_types_grouped, sources_list, in_both,
+             sensitivity_human, canonical_marker),
+    by = "Symbol"
+  ) %>%
+  mutate(
+    sig = case_when(
+      adj.P.Val < 0.05 & logFC >  1 ~ "up",
+      adj.P.Val < 0.05 & logFC < -1 ~ "down",
+      TRUE ~ "ns"
+    ),
+    confidence = case_when(
+      in_both                       ~ "Both databases",
+      sources_list == "PanglaoDB"   ~ "PanglaoDB only",
+      sources_list == "CellMarker2" ~ "CellMarker2 only"
+    )
+  ) %>%
+  arrange(logFC)
+```
+
+```{r}
+eryth_de_show <- eryth_de_combined %>%
+    dplyr::select(Symbol, logFC, adj.P.Val, sig, confidence,
+           sensitivity_human, cell_types, cell_types_grouped) %>%
+    arrange(logFC)
+
+num_cols <- names(eryth_de_show)[vapply(eryth_de_show, is.numeric, logical(1))]
+
+FC_THRESH  <- 1
+FDR_THRESH <- 0.05
+
+vol_df <- res %>%
+  mutate(
+    sig = case_when(
+      adj.P.Val < FDR_THRESH & logFC >  FC_THRESH ~ "up",
+      adj.P.Val < FDR_THRESH & logFC < -FC_THRESH ~ "down",
+      TRUE ~ "ns"
+    ),
+    is_eryth_de = Symbol %in% eryth_de_show$Symbol
+  )
+
+top_df <- filter(vol_df, is_eryth_de) %>%
+  arrange(desc(logFC)) %>%
+  head(5)
+
+vol_df <- vol_df[-which(vol_df$Symbol == "SLC6A8"), ]
+
+sig_counts <- vol_df %>%
+  filter(sig != "ns") %>%
+  dplyr::count(sig)
+
+## PLOT =========================================================
+p_volcano <- ggplot(vol_df, aes(x = logFC, y = neg_log10_fdr)) +
+  geom_point(
+    data = filter(vol_df, sig == "ns"),
+    aes(color = "ns"), alpha = 0.4, size = 0.8
+  ) +
+  geom_point(
+    data = filter(vol_df, sig == "up"),
+    aes(color = "Up"), alpha = 0.65, size = 2.5
+  ) +
+  geom_point(
+    data = filter(vol_df, sig == "down"),
+    aes(color = "Down"), alpha = 0.65, size = 2.5
+  ) +
+  geom_point(
+    data = filter(vol_df, is_eryth_de),
+    aes(color = "Erythroid"), size = 3.5,
+    shape = 18
+  ) +
+  scale_color_manual(
+    name   = NULL,
+    values = c(
+      "ns"        = "grey75",
+      "Up"        = "#E05C5C",
+      "Down"      = "#4A90D9",
+      "Erythroid" = "#7C3393"
+    ),
+    guide = guide_legend(
+      override.aes = list(
+        size  = c(3.5, 3.5, 2, 3.5),
+        shape = c(16, 18, 16, 16),
+        alpha = c(1, 1, 1, 1)
+      )
+    )
+  )  +
+  geom_label_repel(
+    data        = top_df,
+    aes(label   = Symbol),
+    color       = "#7C3393",
+    fill        = "white",
+    fontface    = "bold",
+    size        = 3.5,
+    box.padding = 0.6,
+    seed        = 42
+  ) +
+  geom_hline(yintercept = -log10(FDR_THRESH), linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = c(-FC_THRESH, FC_THRESH), linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  annotate("text",
+    x = max(vol_df$logFC, na.rm = TRUE) * 0.45,
+    y = max(vol_df$neg_log10_fdr, na.rm = TRUE) * 0.95,
+    label = paste0("Up: ", filter(sig_counts, sig == "up")$n),
+    color = "#E05C5C", size = 5.6, hjust = 1
+  ) +
+  annotate("text",
+    x = min(vol_df$logFC, na.rm = TRUE) * 1,
+    y = max(vol_df$neg_log10_fdr, na.rm = TRUE) * 0.95,
+    label = paste0("Down: ", filter(sig_counts, sig == "down")$n),
+    color = "#4A90D9", size = 5.6, hjust = 0
+  ) +
+  scale_x_continuous(name = expression(log[2]*FC)) +
+  scale_y_continuous(name = expression(-log[10]*~FDR)) +
+  labs(
+    title    = "Differential expression — Erythroid markers",
+    subtitle = paste0(
+      "FDR < ", FDR_THRESH, "  |  |logFC/IQR| > ", FC_THRESH,
+      "  |  n = ", nrow(vol_df), " genes"
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title       = element_blank(),
+    plot.subtitle    = element_blank(),
+    axis.text        = element_text(size = 15,  color = "grey20"),
+    axis.title       = element_text(size = 16),
+    legend.title     = element_blank(),
+    legend.text      = element_text(size = 12),
+    legend.key.size  = unit(0.5, "lines"),
+    panel.grid.major = element_line(color = "grey93", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(4, 6, 4, 4),
+    legend.position  = "right"
+  )
+```
+
+```{r fig.width=5, fig.height=3.5}
+p_volcano
+
+filename = "SLC6A8continuous_volcano_erythroid_markers.pdf"
+
+ggsave(filename = file.path(params$fig_dir, filename),
+       plot = p_volcano, width = 5, height = 3.5)
+```
+
+```{r}
+## PLOT - NO LABELS ========================================================
+p_volcano <- ggplot(vol_df, aes(x = logFC, y = neg_log10_fdr)) +
+  geom_point(
+    data = filter(vol_df, sig == "ns"),
+    aes(color = "ns"), alpha = 0.4, size = 1.3
+  ) +
+  geom_point(
+    data = filter(vol_df, sig == "up"),
+    aes(color = "Up"), alpha = 0.65, size = 2.5
+  ) +
+  geom_point(
+    data = filter(vol_df, sig == "down"),
+    aes(color = "Down"), alpha = 0.65, size = 2.5
+  ) +
+  scale_color_manual(
+    name   = NULL,
+    values = c(
+      "ns"        = "grey75",
+      "Up"        = "#E05C5C",
+      "Down"      = "#4A90D9"
+      ),
+    guide = guide_legend(
+      override.aes = list(
+        size  = c(3.5, 2.5, 3.5),
+        shape = c(16, 16, 16),
+        alpha = c(1, 1, 1)
+      )
+    )
+  )  +
+  geom_hline(yintercept = -log10(FDR_THRESH), linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_vline(xintercept = c(-FC_THRESH, FC_THRESH), linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  annotate("text",
+    x = max(vol_df$logFC, na.rm = TRUE) * 0.45,
+    y = max(vol_df$neg_log10_fdr, na.rm = TRUE) * 0.95,
+    label = paste0("Up: ", filter(sig_counts, sig == "up")$n),
+    color = "#E05C5C", size = 5.6, hjust = 1
+  ) +
+  annotate("text",
+    x = min(vol_df$logFC, na.rm = TRUE) * 1,
+    y = max(vol_df$neg_log10_fdr, na.rm = TRUE) * 0.95,
+    label = paste0("Down: ", filter(sig_counts, sig == "down")$n),
+    color = "#4A90D9", size = 5.6, hjust = 0
+  ) +
+  scale_x_continuous(name = expression(log[2]*FC)) +
+  scale_y_continuous(name = expression(-log[10]*~FDR)) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title       = element_blank(),
+    plot.subtitle    = element_blank(),
+    axis.text        = element_text(size = 15,  color = "grey20"),
+    axis.title       = element_text(size = 16),
+    legend.title     = element_blank(),
+    legend.text      = element_text(size = 12),
+    legend.key.size  = unit(0.5, "lines"),
+    panel.grid.major = element_line(color = "grey93", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(4, 6, 4, 4),
+    legend.position  = "right"
+  )
+```
+
+```{r fig.width=5, fig.height=3.5}
+p_volcano
+
+filename = "SLC6A8continuous_volcano.pdf"
+
+ggsave(filename = file.path(params$fig_dir, filename),
+       plot = p_volcano, width = 5, height = 3.5)
+```
+
+## Supplementary Figure 14 B-C;  Barcode plots heme/ hemoglobin
+
+```{r}
+hem_id <- c("HALLMARK_HEME_METABOLISM", "GOBP_HEMOGLOBIN_METABOLIC_PROCESS")
+gsea_out <- readRDS("../../tcga_slc6a8_rnaseq/results/rds_slc6a8_continuous/gsea_output.rds")
+
+library(enrichplot)
+library(patchwork)
+
+hem_idx <- which(gsea_out@result$ID %in% hem_id)
+
+id    <- gsea_out@result$ID[hem_idx[1]]
+nes   <- round(gsea_out@result$NES[hem_idx[1]], 2)
+fdr   <- formatC(gsea_out@result$p.adjust[hem_idx[1]], format = "e", digits = 1)
+
+out1 <- gseaplot2(
+    gsea_out,
+    geneSetID  = hem_idx[1],
+    title      = sprintf("%s\nNES = %s  |  FDR = %s", id, nes, fdr),
+    base_size  = 14,
+    rel_heights = c(1.5, 0.5, 0.7),
+    subplots = 1:3,
+    pvalue_table = FALSE
+)
+
+out1[[1]] <- out1[[1]] +  theme(axis.title.y = element_text(size = 10.2))
+out1[[3]] <- out1[[3]] + theme(axis.title.y = element_text(size = 10.2),
+                           axis.title.x = element_text(size = 14))
+```
+
+```{r fig.width=4.5, fig.height=4}
+out1
+
+filename = "Barcode_plot_HALLMARK_HEME_METABOLISM.pdf"
+
+ggsave(filename = file.path(params$fig_dir, filename),
+       plot = out1, width = 4.5, height = 4)
+```
+
+## Supplementary Figure 14D:
+
+```{r}
+plot_df <- erythroid_scores
+
+ct        <- cor.test(plot_df$slc6a8_logcpm_resid, plot_df$eryth_resid,
+                      method = "pearson", use = "complete.obs")
+r_partial <- ct$estimate
+p_val     <- ct$p.value
+
+ann_label <- paste0(
+  "r = ", sprintf("%.2f", r_partial), "\n",
+  format_pval_plain(p_val)
+)
+
+p_eryth <- ggplot(plot_df, aes(x = slc6a8_logcpm_resid, y = eryth_resid)) +
+  geom_hline(yintercept = 0, color = "grey80", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey80", linewidth = 0.5) +
+  geom_point(alpha = 0.35, size = 3.2, color = "#D96C6C") +
+  geom_smooth(method    = "lm", se = TRUE,
+              color     = "#D73027", fill = "#FDAE61",
+              linewidth = 1.5, alpha = 0.42) +
+  annotate("text",
+           x = Inf, y = -Inf,
+           label     = ann_label,
+           hjust     = 1.05, vjust = -0.25,
+           size      = 5.5, color = "black", lineheight = 1.45) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position  = "none",
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 12),
+    axis.text.y      = element_text(size = 12),
+    axis.title.y     = element_text(size = 13),
+    axis.title.x     = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.subtitle    = element_blank()
+  ) +
+  labs(
+    x = "SLC6A8",
+    y = "Erythroid score "
+  ) +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 15),
+    axis.text    = element_text(size = 12),
+    axis.text.x  = element_text(angle = 0, hjust = 0.5),
+    plot.title    = element_blank(),
+    plot.subtitle = element_blank()
+  )
+```
+
+```{r fig.width=5, fig.height=3}
+p_eryth
+
+filename = "ErythroidScore_vs_SLC6A8_pearson_corr.pdf"
+
+ggsave(filename = file.path(params$fig_dir, filename),
+       plot = p_eryth, width = 5, height = 3)
+```
+
+## Supplementary Figure 14F:
+
+```{r}
+plot_df <- erythroid_scores
+
+ct        <- cor.test(plot_df$slc6a8_logcpm_resid_eryth_corrected, plot_df$eryth_resid_eryth_corrected,
+                      method = "pearson", use = "complete.obs")
+r_partial <- ct$estimate
+p_val     <- ct$p.value
+
+ann_label <- paste0(
+  "r = ", sprintf("%.2f", r_partial), "\n",
+  format_pval_plain(p_val)
+)
+
+p_eryth <- ggplot(plot_df, aes(x = slc6a8_logcpm_resid_eryth_corrected, y = eryth_resid_eryth_corrected)) +
+  geom_hline(yintercept = 0, color = "grey80", linewidth = 0.5) +
+  geom_vline(xintercept = 0, color = "grey80", linewidth = 0.5) +
+  geom_point(alpha = 0.35, size = 3.2, color = "#D96C6C") +
+  geom_smooth(method    = "lm", se = TRUE,
+              color     = "#D73027", fill = "#FDAE61",
+              linewidth = 1.5, alpha = 0.42) +
+  annotate("text",
+           x = Inf, y = -Inf,
+           label     = ann_label,
+           hjust     = 1.05, vjust = -0.25,
+           size      = 5.5, color = "black", lineheight = 1.45) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position  = "none",
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 12),
+    axis.text.y      = element_text(size = 12),
+    axis.title.y     = element_text(size = 13),
+    axis.title.x     = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.subtitle    = element_blank()
+  ) +
+  labs(
+    x = "SLC6A8",
+    y = "Erythroid score "
+  ) +
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 15),
+    axis.text    = element_text(size = 12),
+    axis.text.x  = element_text(angle = 0, hjust = 0.5),
+    plot.title    = element_blank(),
+    plot.subtitle = element_blank()
+  )
+```
+
+```{r fig.width=5, fig.height=3}
+p_eryth
+
+filename = "ErythroidScore_vs_SLC6A8_pearson_corr_erythroid_corrected.pdf"
+
+ggsave(filename = file.path(params$fig_dir, filename),
+       plot = p_eryth, width = 5, height = 3)
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

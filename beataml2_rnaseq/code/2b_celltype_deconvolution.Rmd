@@ -1,0 +1,414 @@
+---
+title: "BeatAML2 cohort analysis;\nCell-type deconvolution"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  workers = 4,
+  interactive = TRUE,
+  prior_count = 2,
+  low_q_threshold = 0.25,
+  high_q_threshold = 0.74,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  rds_dir = "../results/rds_slc6a8_continuous/",
+  table_dir = "../results/tables_slc6a8_continuous/",
+  data_dir = "../data/",
+  fig_dir = "../results/figures_slc6a8_continuous/",
+  msigdb_dir = "../../references/MSigDb_2025.1/"
+)
+
+# Load packages ----------------------------------------------------------------
+library(BiocParallel)
+library(yaml)
+library(DT)
+library(writexl)
+library(unikn)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(pheatmap)
+library(RColorBrewer)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(data.table)
+library(forcats)
+library(scales)
+library(factoextra)
+library(ggridges)
+library(reshape2)
+library(matrixStats)
+library(readxl)
+library(SingleCellExperiment)
+library(MuSiC)
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+if(!dir.exists(params$rds_dir)) dir.create(params$rds_dir, recursive = TRUE)
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir, recursive = TRUE)
+if(!dir.exists(params$table_dir)) dir.create(params$table_dir, recursive = TRUE)
+```
+
+# Load data
+
+```{r}
+dge_red <- readRDS("../results/rds_slc6a8_continuous/expression_set.rds")
+dat_aml_bm <- readRDS("../data/AML_scAtlas_subset.rds")
+library(zellkonverter)
+library(Seurat)
+dat_pb <- readH5AD("../data/TabulaSapiens_Blood_1bf55482-ad49-446a-87c6-f3442bebcef1.h5ad", reader = "R")
+```
+
+## BM AML atlas
+
+```{r}
+aml_like_types <- c("LSC", "GMP-like", "HSC-like",
+                    "Prog-like", "cDC-like")
+```
+
+# Prepare data
+
+## Build fine-grained reference labels for the Bone Marrow single-cell reference
+
+```{r}
+cd_bm <- as.data.frame(colData(dat_aml_bm))
+
+cd_bm$fine_label <- dplyr::case_when(
+  !is.na(cd_bm$HSPC.Cell.Type) & cd_bm$HSPC.Cell.Type %in% aml_like_types ~
+    as.character(cd_bm$HSPC.Cell.Type),
+  TRUE ~ as.character(cd_bm$cell_type)
+)
+
+colData(dat_aml_bm)$fine_label <- cd_bm$fine_label
+
+table(dat_aml_bm$fine_label, useNA = "ifany")
+```
+
+## Subset Blood reference to 10X cells and build its fine-grained label
+
+```{r}
+dat_pb_10x <- dat_pb[, dat_pb$method == "10X"]
+```
+
+```{r}
+pb_label_col <- "broad_cell_class"
+colData(dat_pb_10x)$fine_label <- as.character(colData(dat_pb_10x)[[pb_label_col]])
+
+table(dat_pb_10x$fine_label, useNA = "ifany")
+```
+
+## QC: donor-by-celltype coverage in Blood single-cell reference (10X subset)
+
+```{r}
+bm_samples <- dge_red$samples$specimenType == "Bone Marrow Aspirate"
+pb_samples <- dge_red$samples$specimenType == "Peripheral Blood"
+
+build_bulk_eset <- function(dge, keep) {
+  counts <- dge$counts[, keep, drop = FALSE]
+  pdata  <- data.frame(
+    SubjectName = dge$samples$OriginalSampleName[keep],
+    row.names   = colnames(counts)
+  )
+  Biobase::ExpressionSet(
+    assayData   = as.matrix(counts),
+    phenoData   = Biobase::AnnotatedDataFrame(pdata)
+  )
+}
+
+bm_bulk_eset <- build_bulk_eset(dge_red, bm_samples)
+pb_bulk_eset <- build_bulk_eset(dge_red, pb_samples)
+```
+
+## Build the combined PB reference (Blood 10X atlas + AML cells from BM atlas)
+
+```{r}
+aml_cells_idx <- which(dat_aml_bm$fine_label %in% aml_like_types)
+aml_counts    <- assay(dat_aml_bm, "counts")[, aml_cells_idx, drop = FALSE]
+aml_fine      <- dat_aml_bm$fine_label[aml_cells_idx]
+aml_donor     <- paste0("BM_", dat_aml_bm$donor_id[aml_cells_idx])
+
+pb_counts <- assay(dat_pb_10x, "decontXcounts")
+pb_fine   <- dat_pb_10x$fine_label
+pb_donor  <- paste0("PB_", dat_pb_10x$donor_id)
+
+common_genes <- intersect(rownames(aml_counts), rownames(pb_counts))
+
+aml_counts <- aml_counts[common_genes, ]
+pb_counts  <- pb_counts[common_genes, ]
+
+combined_counts <- cbind(aml_counts, pb_counts)
+combined_fine   <- c(aml_fine, pb_fine)
+combined_donor  <- c(aml_donor, pb_donor)
+
+pb_sc_sce <- SingleCellExperiment(
+  assays  = list(counts = combined_counts),
+  colData = DataFrame(cellType = combined_fine, SubjectName = combined_donor)
+)
+
+table(colData(pb_sc_sce)$cellType)
+```
+
+# MuSiC
+
+## Running and results tables
+
+```{r,  results='asis'}
+bm_select_ct <- setdiff(unique(dat_aml_bm$fine_label), NA)
+
+music_bm_file <- file.path(params$rds_dir, "music_bm_estimation.rds")
+
+if(!file.exists(music_bm_file)){
+
+  music_bm <- music_prop(
+    bulk.mtx  = exprs(bm_bulk_eset),
+    sc.sce    = dat_aml_bm,
+    clusters  = "fine_label",
+    samples   = "donor_id",
+    select.ct = bm_select_ct,
+    verbose   = TRUE
+  )
+  saveRDS(music_bm, file = music_bm_file)
+
+} else {
+
+  music_bm <- readRDS(music_bm_file )
+
+}
+
+bm_prop <- as.data.frame(music_bm$Est.prop.weighted) %>%
+  rownames_to_column("sample_id")
+
+print(htmltools::tagList(datatable(bm_prop,
+                                   extensions = "Buttons", options = list(
+                                     dom = "Bfrtip",
+                                     buttons = c("copy", "csv", "excel")
+                                   )) %>%
+                         formatRound(
+                            columns = setdiff(colnames(bm_prop), c("sample_id")),
+                            digits = 3
+                          )
+                         ))
+```
+
+```{r,  results='asis'}
+pb_select_ct <- setdiff(unique(combined_fine), NA)
+
+music_pb_file <- file.path(params$rds_dir, "music_pb_estimation.rds")
+if(!file.exists(music_pb_file)){
+
+  music_pb <- music_prop(
+    bulk.mtx  = exprs(pb_bulk_eset),
+    sc.sce    = pb_sc_sce,
+    clusters  = "cellType",
+    samples   = "SubjectName",
+    select.ct = pb_select_ct,
+    verbose   = TRUE
+  )
+  saveRDS(music_pb, file = music_pb_file)
+
+} else {
+
+  music_pb <- readRDS(music_pb_file )
+
+}
+
+pb_prop <- as.data.frame(music_pb$Est.prop.weighted) %>%
+  rownames_to_column("sample_id")
+
+print(htmltools::tagList(datatable(pb_prop,
+                                   extensions = "Buttons", options = list(
+                                     dom = "Bfrtip",
+                                     buttons = c("copy", "csv", "excel")
+                                   )) %>%
+                         formatRound(
+                            columns = setdiff(colnames(pb_prop), c("sample_id")),
+                            digits = 3
+                          )
+                         ))
+```
+
+## MuSiC results
+
+### Fine resolution {.tabset}
+
+```{r}
+drop_zero_celltypes <- function(prop_df, tol = 1e-8) {
+  col_sums   <- colSums(prop_df[, -1, drop = FALSE])
+  zero_cols  <- names(col_sums)[col_sums <= tol]
+  if (length(zero_cols) > 0) {
+    cat("Dropping zero-proportion cell types: ", paste(zero_cols, collapse = ", "), "\n")
+  }
+  prop_df[, !(colnames(prop_df) %in% zero_cols), drop = FALSE]
+}
+
+bm_prop <- drop_zero_celltypes(bm_prop)
+pb_prop <- drop_zero_celltypes(pb_prop)
+```
+
+```{r}
+library(viridis)
+```
+
+### Post-hoc checks
+
+```{r}
+rollup_proportions <- function(prop_df, aml_types) {
+  aml_cols   <- intersect(aml_types, colnames(prop_df))
+  other_cols <- setdiff(colnames(prop_df), c("sample_id", "Erythroid", aml_cols))
+
+  prop_df %>%
+    mutate(
+      prop_AML       = rowSums(across(all_of(aml_cols))),
+      prop_Erythroid = if ("Erythroid" %in% colnames(prop_df)) Erythroid else 0,
+      prop_Other     = rowSums(across(all_of(other_cols)))
+    ) %>%
+    select(sample_id, prop_AML, prop_Erythroid, prop_Other, everything())
+}
+
+bm_prop_rolled <- rollup_proportions(bm_prop, aml_like_types)
+pb_prop_rolled <- rollup_proportions(pb_prop, aml_like_types)
+```
+
+```{r}
+diag_bm <- tibble(
+  sample_id    = names(music_bm$r.squared.full),
+  r_squared_bm = music_bm$r.squared.full
+)
+diag_pb <- tibble(
+  sample_id    = names(music_pb$r.squared.full),
+  r_squared_pb = music_pb$r.squared.full
+)
+
+deconv_all <- bind_rows(
+  bm_prop_rolled %>% left_join(diag_bm, by = "sample_id") %>% mutate(tissue = "BM", r_squared = r_squared_bm),
+  pb_prop_rolled %>% left_join(diag_pb, by = "sample_id") %>% mutate(tissue = "PB", r_squared = r_squared_pb)
+) %>%
+  select(sample_id, tissue, prop_AML, prop_Erythroid, prop_Other, r_squared)
+
+dge_red$samples <- dge_red$samples %>%
+  left_join(deconv_all, by = c("OriginalSampleName" = "sample_id"))
+```
+
+# CIBERSORTx
+
+## Procedure on the web portal
+
+### Bulk mixture files (one per specimen type)
+
+```{r}
+gene_map_bm <- as.data.frame(rowData(dat_aml_bm)) %>%
+  select(ensembl_id = 1, gene_symbol) %>%
+  distinct()
+
+gene_map_bm <- data.frame(
+  ensembl_id  = rownames(dat_aml_bm),
+  gene_symbol = rowData(dat_aml_bm)$gene_symbol,
+  stringsAsFactors = FALSE
+) %>% distinct()
+
+gene_map_pb <- data.frame(
+  ensembl_id  = rownames(dat_pb),
+  gene_symbol = rowData(dat_pb)$feature_name,
+  stringsAsFactors = FALSE
+) %>% distinct()
+
+gene_map <- bind_rows(gene_map_bm, gene_map_pb) %>%
+  distinct(ensembl_id, .keep_all = TRUE)
+```
+
+```{r}
+library(edgeR)
+library(dplyr)
+
+cpm_mat <- edgeR::cpm(dge_red$counts, log = FALSE)
+
+symbol_map <- gene_map[match(rownames(cpm_mat), gene_map$ensembl_id), "gene_symbol"]
+cpm_df <- as.data.frame(cpm_mat) %>%
+  mutate(GeneSymbol = symbol_map) %>%
+  filter(!is.na(GeneSymbol)) %>%
+  group_by(GeneSymbol) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>% as.data.frame()
+
+bm_samples <- dge_red$samples$OriginalSampleName[dge_red$samples$specimenType == "Bone Marrow Aspirate" ]
+pb_samples <- dge_red$samples$OriginalSampleName[dge_red$samples$specimenType == "Peripheral Blood"]
+
+write.table(cpm_df[, c("GeneSymbol", bm_samples)],
+            file.path(params$table_dir, "mixture_BM.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(cpm_df[, c("GeneSymbol", pb_samples)],
+            file.path(params$table_dir, "mixture_PB.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+### Single-cell reference files (BM and PB)
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+
+export_sc_reference <- function(sce, label_col, gene_map, out_path, max_cells_per_class = 100) {
+  counts_mat <- assay(sce, "counts")
+  labels <- colData(sce)[[label_col]]
+
+  set.seed(1)
+  keep_idx <- unlist(lapply(split(seq_along(labels), labels), function(idx) {
+    sample(idx, size = min(length(idx), max_cells_per_class))
+  }))
+  counts_mat <- counts_mat[, keep_idx]
+  labels <- as.character(labels[keep_idx])
+
+  symbol_map <- gene_map$gene_symbol[match(rownames(counts_mat), gene_map$ensembl_id)]
+  keep_genes <- !is.na(symbol_map)
+  counts_mat <- counts_mat[keep_genes, ]
+  symbol_map <- symbol_map[keep_genes]
+
+  dense <- as.matrix(counts_mat)
+  collapsed <- rowsum(dense, group = symbol_map)
+  colnames(collapsed) <- labels
+
+  out <- data.frame(GeneSymbol = rownames(collapsed), collapsed,
+                     check.names = FALSE, stringsAsFactors = FALSE)
+
+  write.table(out, out_path, sep = "\t", quote = FALSE, row.names = FALSE)
+}
+
+export_sc_reference(dat_aml_bm, "fine_label", gene_map,
+                    file.path(params$table_dir, "reference_BM.txt"))
+export_sc_reference(pb_sc_sce, "cellType", gene_map,
+                    file.path(params$table_dir, "reference_PB.txt"))
+```
+
+# Sessioninfo
+
+```{r}
+sessionInfo()
+```
+

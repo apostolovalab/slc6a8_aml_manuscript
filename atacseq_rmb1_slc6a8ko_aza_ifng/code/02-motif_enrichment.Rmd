@@ -1,0 +1,286 @@
+---
+title: "RMB-1 SLC6A8 KO ATAC-seq — motif enrichment (monaLisa)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r}
+params <- list(
+  res_dir = "../results",
+  genome_fa = "../results/genome/GRCm39.primary_assembly.genome.fa",
+  gtf = "../data/ref/gencode.vM35.primary_assembly.annotation.gtf.gz",
+  pwm_rds = "../data/ref/jaspar2024_core_vertebrates_pwm.rds",
+  fdr = 0.05,
+  seq_width = 200,
+  n_per_bin = 3000,
+  min_abs_lfc = 0.3,
+  max_bin0 = 10000,
+  min_score = 10,
+  sig_padj = 4,
+  max_heat = 60,
+  target_genes = c("Ciita", "Cd40", "Cd80", "Cd86", "H2-Aa", "H2-Ab1", "H2-Eb1"),
+  flank = 25000,
+  n_cores = 8,
+  rerun = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(tidyr); library(ggplot2)
+  library(monaLisa)
+  library(JASPAR2024); library(TFBSTools)
+  library(Rsamtools); library(Biostrings); library(GenomicRanges); library(rtracklayer)
+  library(SummarizedExperiment); library(BiocParallel); library(ComplexHeatmap)
+  library(dplyr); library(stringr); library(purrr)
+  library(tibble); library(readr); library(patchwork)
+  library(DT)
+})
+source("../../scripts/functions.R", local = TRUE)
+
+bpp <- MulticoreParam(params$n_cores)
+set.seed(1)
+```
+
+```{r}
+# ---- Paths and inputs ----
+in_rds   <- file.path(params$res_dir, "rds", "diffbind", "edger_fit_results.rds")
+out_tab  <- file.path(params$res_dir, "tables", "motifs")
+out_rds  <- file.path(params$res_dir, "rds",    "motifs")
+out_plot <- file.path(params$res_dir, "plots",  "motifs")
+walk(c(out_tab, out_rds, out_plot), dir.create, recursive = TRUE, showWarnings = FALSE)
+
+# ---- DA results from the edgeR QL report: one table per contrast ----
+edger_obj <- readRDS(in_rds)
+contrasts <- names(edger_obj$res)
+
+# ---- Genome FASTA (uncompressed or bgzipped, indexed) ----
+fa <- FaFile(params$genome_fa)
+if (!file.exists(paste0(params$genome_fa, ".fai"))) indexFa(fa)
+keep_chr <- intersect(paste0("chr", c(1:19, "X", "Y")), seqlevels(fa))
+```
+
+```{r}
+# ---- Peaks -> GRanges (optionally re-centred to a fixed width) ----
+make_regions <- function(tbl, keep_chr, width = NULL) {
+  gr <- GRanges(tbl$peak_id)
+  mcols(gr) <- tbl |> select(any_of(c("peak_id", "logFC", "logCPM", "FDR",
+                                      "gene_name", "annotation", "class")))
+  gr <- gr[as.character(seqnames(gr)) %in% keep_chr]
+  if (!is.null(width)) gr <- resize(gr, width = width, fix = "center")
+  gr
+}
+
+# ---- Sequences named by peak_id ----
+get_seqs <- function(gr, fa) {
+  s <- getSeq(fa, gr)
+  names(s) <- gr$peak_id
+  s
+}
+
+# ---- Down-sample the unchanged bin, keeping monaLisa bin attributes ----
+downsample_bin0 <- function(bins, max_n) {
+  b0  <- attr(bins, "bin0")
+  if (is.null(b0) || is.na(b0)) return(seq_along(bins))
+  i0  <- which(as.integer(bins) == b0)
+  sort(c(setdiff(seq_along(bins), i0), sample(i0, min(max_n, length(i0)))))
+}
+
+subset_bins <- function(bins, idx) {
+  b_new <- bins[idx]
+  for (a in setdiff(names(attributes(bins)), c("levels", "class", "names")))
+    attr(b_new, a) <- attr(bins, a)
+  b_new
+}
+
+# ---- Curated TF families ----
+fam_patterns <- c(
+  "STAT"                = "^STAT",
+  "IRF"                 = "^IRF",
+  "USF (Ciita pIV)"     = "^USF",
+  "NF-kB"               = "^(NFKB|REL)",
+  "RFX (SXY X1)"        = "^RFX",
+  "CREB/ATF1 (SXY X2)"  = "^(CREB1|ATF1)$",
+  "NF-Y (SXY Y)"        = "^NFY"
+)
+
+annotate_family <- function(motif_names, patterns = fam_patterns) {
+  map_chr(motif_names, \(nm) {
+    hit <- names(patterns)[str_detect(nm, regex(patterns, ignore_case = TRUE))]
+    if (length(hit)) hit[1] else NA_character_
+  })
+}
+
+# ---- monaLisa SE -> long tibble ----
+tidy_enr <- function(se) {
+  long <- map(c("log2enr", "negLog10P", "negLog10Padj"), \(a) {
+    assay(se, a) |>
+      as_tibble(rownames = "motif_id") |>
+      pivot_longer(-motif_id, names_to = "bin", values_to = a)
+  }) |>
+    reduce(left_join, by = c("motif_id", "bin"))
+
+  tibble(motif_id = rownames(se), motif_name = unname(rowData(se)$motif.name)) |>
+    right_join(long, by = "motif_id") |>
+    mutate(family = unname(annotate_family(motif_name)))
+}
+
+# ---- Keep motifs significant in >= 1 bin ----
+filter_sig_rows <- function(se, min_negLog10Padj = -log10(0.05)) {
+  max_sig <- apply(assay(se, "negLog10Padj"), 1, \(x) max(x, 0, na.rm = TRUE))
+  se[max_sig > min_negLog10Padj, ]
+}
+
+# ---- Report helpers: tab headers and DT tables inside loops ----
+tab_header <- function(title, level = 3) {
+  cat("\n\n", strrep("#", level), " ", title, " {.unlisted .unnumbered}\n\n", sep = "")
+}
+
+show_dt <- function(tbl, round_cols = NULL, signif_cols = NULL) {
+  dt <- default_dt(tbl)
+  round_cols  <- intersect(round_cols,  names(tbl))
+  signif_cols <- intersect(signif_cols, names(tbl))
+  if (length(round_cols))  dt <- formatRound(dt, columns = round_cols, digits = 3)
+  if (length(signif_cols)) dt <- formatSignif(dt, columns = signif_cols)
+  print(htmltools::tagList(dt))
+  cat("\n\n")
+}
+
+# ---- Heatmap: top motifs clustered by PWM similarity ----
+plot_top_motifs <- function(se, sig_padj, max_heat, bpp, width = 1.8, show_motif_GC = FALSE) {
+  max_sig <- apply(assay(se, "negLog10Padj"), 1, \(x) max(x, 0, na.rm = TRUE))
+  ids     <- names(sort(max_sig[max_sig > sig_padj], decreasing = TRUE)) |> head(max_heat)
+  if (length(ids) < 2) {
+    cat("Fewer than 2 motifs pass the significance cutoff.\n\n")
+    return(invisible(NULL))
+  }
+  se_sel <- se[ids, ]
+  sim    <- motifSimilarity(rowData(se_sel)$motif.pfm, BPPARAM = bpp)
+  hcl    <- hclust(as.dist(1 - sim), method = "average")
+  plotMotifHeatmaps(se_sel, which.plots = c("log2enr", "negLog10Padj"),
+                    width = width, cluster = hcl, show_dendrogram = TRUE,
+                    maxEnr = 2, maxSig = 10, show_seqlogo = TRUE,
+                    width.seqlogo = 1.2, show_motif_GC = show_motif_GC)
+  cat("\n\n")
+}
+
+# ---- Heatmap: curated families (optionally significant rows only) ----
+plot_curated <- function(se, motif_ids, width = 1.8, sig_only = FALSE, show_motif_GC = FALSE) {
+  se_f <- se[motif_ids, ]
+  if (sig_only) se_f <- filter_sig_rows(se_f)
+  if (nrow(se_f) == 0) {
+    cat("No curated motif reaches padj < 0.05.\n\n")
+    return(invisible(NULL))
+  }
+  plotMotifHeatmaps(se_f, which.plots = c("log2enr", "negLog10Padj"),
+                    width = width, cluster = FALSE, maxEnr = 2, maxSig = 10,
+                    show_seqlogo = TRUE, width.seqlogo = 1.2,
+                    show_motif_GC = show_motif_GC)
+  cat("\n\n")
+}
+```
+
+# Motif collection
+
+```{r results='asis'}
+pwms     <- readRDS(params$pwm_rds)
+pwm_name <- map_chr(as.list(pwms), name)
+pwm_fam  <- annotate_family(pwm_name)
+
+# ---- Curated motif IDs in family order (shared by all monaLisa results) ----
+fam_ord <- tibble(motif_id = names(pwms), family = pwm_fam) |>
+  filter(!is.na(family)) |>
+  mutate(family = factor(family, levels = names(fam_patterns))) |>
+  arrange(family)
+
+pwms_contingency <- tibble(motif = pwm_name, family = pwm_fam) |>
+  filter(!is.na(family)) |>
+  arrange(family, motif) |>
+  group_by(family) |>
+  summarise(n = n(), motifs = paste(motif, collapse = ", "))
+
+show_dt(pwms_contingency)
+```
+
+# Up / Down vs unchanged across all three contrasts
+
+```{r}
+# ---- DA class per contrast, NS capped ----
+classify_da <- function(tbl, fdr, max_ns) {
+  tbl |>
+    mutate(class = case_when(FDR < fdr & logFC > 0 ~ "Up",
+                             FDR < fdr & logFC < 0 ~ "Down",
+                             TRUE                  ~ "NS")) |>
+    group_by(class) |>
+    group_modify(\(d, k) if (k$class == "NS" && nrow(d) > max_ns)
+                           slice_sample(d, n = max_ns) else d) |>
+    ungroup()
+}
+
+run_class_enr <- function(tbl, pwm_sub, fa, keep_chr, width, min_score, bpp) {
+  gr   <- make_regions(tbl, keep_chr, width = width)
+  bins <- droplevels(factor(gr$class, levels = c("Down", "NS", "Up")))
+  calcBinnedMotifEnrR(seqs = get_seqs(gr, fa), bins = bins, pwmL = pwm_sub,
+                      background = "otherBins", min.score = min_score,
+                      BPPARAM = bpp)
+}
+
+cls_file <- file.path(out_rds, "monalisa_class_all_contrasts.rds")
+
+if (!params$rerun && file.exists(cls_file)) {
+  cls_se <- readRDS(cls_file)
+} else {
+  pwm_sub <- pwms[!is.na(pwm_fam)]
+  cls_se  <- map(edger_obj$res, \(tbl) {
+    classify_da(tbl, params$fdr, params$max_bin0) |>
+      run_class_enr(pwm_sub, fa, keep_chr, params$seq_width, params$min_score, bpp)
+  })
+  saveRDS(cls_se, cls_file)
+}
+
+cls_long <- map(cls_se, tidy_enr) |>
+  bind_rows(.id = "contrast") |>
+  mutate(contrast = factor(contrast, levels = names(edger_obj$res)),
+         family   = factor(family, levels = names(fam_patterns))) |>
+  arrange(desc(negLog10Padj))
+
+write_csv(cls_long, file.path(out_tab, "monalisa_class_all_contrasts.csv"))
+```
+
+```{r}
+library(edgeR)
+```
+
+```{r}
+library(GenomicAlignments)
+library(GenomeInfoDb)
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+

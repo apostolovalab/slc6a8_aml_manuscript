@@ -1,0 +1,331 @@
+---
+title: "TCGA cohort analysis;\nHeme/ Erythrocytes association with SLC6A8 DE genes"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  workers = 4,
+  interactive = TRUE,
+  prior_count = 2,
+  low_q_threshold = 0.25,
+  high_q_threshold = 0.74,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  rds_dir = "../results/rds_slc6a8_continuous/",
+  table_dir = "../results/tables_slc6a8_continuous/",
+  data_dir = "../data/",
+  fig_dir = "../results/figures_slc6a8_continuous/",
+  msigdb_dir = "../../references/MSigDb_2025.1/"
+)
+
+# Load packages ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(BiocParallel)
+  library(yaml)
+  library(DT)
+  library(writexl)
+  library(yulab.utils)
+  library(edgeR)
+  library(limma)
+  library(unikn)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+  library(dplyr)
+  library(data.table)
+  library(forcats)
+  library(scales)
+  library(factoextra)
+  library(ggridges)
+  library(car)
+  library(reshape2)
+  library(matrixStats)
+  library(kableExtra)
+  library(clusterProfiler)
+  library(readxl)
+  library(GSVA)
+})
+
+# Load functions ---------------------------------------------------------------
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+if(!dir.exists(params$rds_dir)) dir.create(params$rds_dir, recursive = TRUE)
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir, recursive = TRUE)
+if(!dir.exists(params$table_dir)) dir.create(params$table_dir, recursive = TRUE)
+
+de_table_cols <- c(
+  "GENEID", "Symbol", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+shiny_path <- file.path(
+  params$rds_dir, "shiny", "rds"
+)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+gene_sets <- readRDS(file.path(params$msigdb_dir, "msigdb_v2025.1.Hs_gene_sets.rds"))
+```
+
+# Load data
+
+```{r}
+dge_red <- readRDS("../results/rds_slc6a8_continuous/expression_set.rds")
+dge_red_norm <- readRDS("../results/rds_slc6a8_continuous/expression_set_normalized.rds")
+
+fit <- readRDS("../results/rds_slc6a8_continuous/limma_results.rds")
+res <- fread("../results/tables_slc6a8_continuous/diffexp_SLC6A8.txt") %>% as.data.frame()
+gsea_res <- fread("../results/tables_slc6a8_continuous/gsea_all.txt") %>% as.data.frame()
+```
+
+# Heme biosynthesis
+
+```{r}
+theme_pub <- function() {
+  theme_bw(base_size = 11) +
+    theme(
+      panel.grid.minor  = element_blank(),
+      strip.background  = element_rect(fill = "#f0f0f0", color = "grey60"),
+      strip.text        = element_text(face = "bold", size = 9),
+      plot.title        = element_text(face = "bold", size = 12),
+      plot.subtitle     = element_text(size = 9, color = "grey40"),
+      legend.position   = "right"
+    )
+}
+```
+
+# Erythroid signature differentiation score
+
+```{r results='asis'}
+eryth_pattern <- paste(
+  "ERYTHRO", "ERYTHROID", "ERYTHROBLAST", "HEMOGLOBIN", "GLOBIN",
+  "HEME_BIOSYNTH", "HEME_METABOL", "PORPHYRIN",
+  "GATA1", "KLF1", "TAL1",
+  "MEGAKARYOCYTE_ERYTHROID", "MEP",
+  "BFU", "CFU_E", "PROERYTHROBLAST", "RETICULOCYTE",
+  sep = "|"
+)
+
+eryth_sets <- gene_sets %>%
+  as.data.frame() %>%
+  filter(
+    grepl(eryth_pattern, geneset_name, ignore.case = TRUE) |
+    grepl("erythroid|erythroblast|heme biosynth|hemoglobin",
+          description_brief, ignore.case = TRUE)
+  )
+
+cat("Erythroid/differentiation gene sets found:", nrow(eryth_sets), "\n")
+
+print(htmltools::tagList(datatable(eryth_sets[,c("collection_name", "geneset_name", "n_ensembl")],
+                                   extensions = "Buttons", options = list(
+                                     dom = "Bfrtip",
+                                     buttons = c("copy", "csv", "excel")
+                                   )) ))
+```
+
+```{r }
+eryth_gs_list <- setNames(
+  lapply(eryth_sets$ensembl, function(x) as.character(x)),
+  eryth_sets$geneset_name
+)
+
+gene = c( "ENSG00000130821")
+ridx <- which(dge_red_norm$genes[, "GENEID"] %in% gene)
+expr_logcpm<- dge_red_norm$counts
+
+expr_logcpm_dedup <- expr_logcpm
+
+overlap_n     <- sapply(eryth_gs_list, function(g) sum(g %in% rownames(expr_logcpm_dedup)))
+eryth_gs_list <- eryth_gs_list[overlap_n >= 5]
+cat("\nGene sets retained (≥5 genes in matrix):", length(eryth_gs_list), "\n")
+print(head(sort(overlap_n[names(eryth_gs_list)], decreasing = TRUE)))
+cat("...\n")
+```
+
+```{r results='asis'}
+gsva_par <- gsvaParam(
+  exprData = expr_logcpm_dedup,
+  geneSets = eryth_gs_list,
+  kcdf     = "Gaussian",
+  minSize  = 5,
+  maxSize  = 500
+)
+gsva_scores <- gsva(gsva_par, verbose = TRUE)
+
+cat("\nGSVA score matrix:", nrow(gsva_scores), "pathways ×",
+    ncol(gsva_scores), "samples\n")
+```
+
+```{r}
+eryth_consensus <- colMeans(gsva_scores)
+
+score_df <- data.frame(
+  sample          = colnames(gsva_scores),
+  eryth_score     = eryth_consensus,
+  t(gsva_scores),
+  check.names     = FALSE
+) %>%
+  left_join(
+    dge_red$samples %>%
+      dplyr::select(OriginalSampleName, slc6a8_norm, slc6a8_raw,
+             FLT3_ITD, NPM1, RUNX1, ASXL1, TP53,
+             BM_BLAST_PERCENTAGE) %>%
+      rename(sample = OriginalSampleName),
+    by = "sample"
+  )
+
+score_df$slc6a8_norm_logcpm <- score_df$slc6a8_norm
+score_df$slc6a8_norm_cqn <- dge_red_norm$counts[gene, ]
+```
+
+### Erythroid score vs SLC6A8 - adjusted {.tabset}
+
+#### Global
+
+```{r}
+design <- model.matrix(
+  ~ slc6a8_norm_logcpm + FLT3_ITD + NPM1 + BM_BLAST_PERCENTAGE,
+  data = score_df
+)
+
+X_cov <- design[, colnames(design) != "slc6a8_norm_logcpm", drop = FALSE]
+
+score_df$slc6a8_logcpm_resid <- lm.fit(X_cov, score_df$slc6a8_norm_logcpm)$residuals
+
+design <- model.matrix(
+  ~ eryth_score + FLT3_ITD + NPM1 + BM_BLAST_PERCENTAGE,
+  data = score_df
+)
+
+X_cov <- design[, colnames(design) != "eryth_score", drop = FALSE]
+
+score_df$eryth_resid <- lm.fit(X_cov, score_df$eryth_score)$residuals
+
+ct <- cor.test(score_df$eryth_resid, score_df$slc6a8_logcpm_resid, method = "pearson")
+if (ct$p.value == 0) ct$p.value <- 2.2e-16
+lab_cor <- sprintf("pearson ρ = %.2f\n pvalue = %.2g", ct$estimate, ct$p.value)
+p_adj <- ggplot(score_df, aes(x = slc6a8_logcpm_resid, y = eryth_resid)) +
+  geom_point(alpha = 0.5, size = 1.4, color = "#555555") +
+  geom_smooth(method = "lm", color = "#E05C5C", se = TRUE, linewidth = 0.9) +
+  annotate("label", x = -Inf, y = Inf, label = lab_cor,
+           hjust = -0.1, vjust = 1.2, size = 3.2, fill = "white",
+           label.size = 0.3) +
+  labs(
+    x = "SLC6A8 (CQN-normalized)",
+    y = "Erythroid score",
+    title    = "Consensus erythroid score vs. SLC6A8 - covariate-adjusted",
+    subtitle = "Adjusted for clinical/ technical covariates; Red line= linear fit"
+  ) +
+  theme_pub()
+p_adj
+```
+
+## Regress out erythroid composition
+
+```{r}
+bm_prop <- fread("../results/tables_slc6a8_continuous//CIBERSORTx_BM.csv") %>% as.data.frame()
+
+bm_eryth_cols <- grep("eryth", colnames(bm_prop), value = TRUE)
+
+bm_prop$eryth_sum <- rowSums(bm_prop[, bm_eryth_cols, drop = FALSE])
+
+score_df<- score_df |>
+  dplyr::left_join(bm_prop[, c("Mixture", "eryth_sum")],
+                   by = c("sample" = "Mixture")) |>
+  dplyr::rename(bm_eryth = eryth_sum)
+score_df$eryth_prop <-  score_df$bm_eryth
+```
+
+```{r}
+design <- model.matrix(
+    ~ slc6a8_norm_logcpm + FLT3_ITD + NPM1 + BM_BLAST_PERCENTAGE + eryth_prop,
+  data = score_df
+)
+
+X_cov <- design[, colnames(design) != "slc6a8_norm_logcpm", drop = FALSE]
+
+score_df$slc6a8_logcpm_resid_eryth_corrected <- lm.fit(X_cov, score_df$slc6a8_norm_logcpm)$residuals
+
+design <- model.matrix(
+    ~ eryth_score + FLT3_ITD + NPM1 + BM_BLAST_PERCENTAGE + eryth_prop,
+  data = score_df
+)
+
+X_cov <- design[, colnames(design) != "eryth_score", drop = FALSE]
+
+score_df$eryth_resid_eryth_corrected <- lm.fit(X_cov, score_df$eryth_score)$residuals
+
+ct <- cor.test(score_df$eryth_resid_eryth_corrected, score_df$slc6a8_logcpm_resid_eryth_corrected, method = "pearson")
+if (ct$p.value == 0) ct$p.value <- 2.2e-16
+lab_cor <- sprintf("pearson ρ = %.2f\n pvalue = %.2g", ct$estimate, ct$p.value)
+p_adj <- ggplot(score_df, aes(x = slc6a8_logcpm_resid_eryth_corrected, y = eryth_resid_eryth_corrected)) +
+  geom_point(alpha = 0.5, size = 1.4, color = "#555555") +
+  geom_smooth(method = "lm", color = "#E05C5C", se = TRUE, linewidth = 0.9) +
+  annotate("label", x = -Inf, y = Inf, label = lab_cor,
+           hjust = -0.1, vjust = 1.2, size = 3.2, fill = "white",
+           label.size = 0.3) +
+  labs(
+    x = "SLC6A8 (CQN-normalized)",
+    y = "Erythroid score",
+    title    = "Consensus erythroid score vs. SLC6A8 - covariate-adjusted",
+    subtitle = "Adjusted for clinical/ technical covariates; Red line= linear fit"
+  ) +
+  theme_pub()
+p_adj
+```
+
+# SessionInfo
+
+```{r}
+write.table((score_df[,c("sample",
+                         "eryth_score", "eryth_resid", "eryth_resid_eryth_corrected",
+                         "slc6a8_raw", "slc6a8_norm_logcpm", "slc6a8_norm_cqn",
+                         "slc6a8_logcpm_resid", "slc6a8_logcpm_resid_eryth_corrected")]),
+            file = file.path(params$table_dir, "erythroid_scores.txt"),
+            quote = FALSE, row.names = FALSE, col.names = TRUE, sep = "\t")
+
+write.table(gsva_scores,
+            file = file.path(params$table_dir, "gsva_erythroid_scores.txt"),
+            quote = FALSE, row.names = TRUE, col.names = TRUE, sep = "\t")
+```
+
+```{r}
+sessionInfo()
+```
+

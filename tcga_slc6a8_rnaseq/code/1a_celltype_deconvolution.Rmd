@@ -1,0 +1,190 @@
+---
+title: "TCGA cohort analysis;\nCell-type deconvolution"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  workers = 4,
+  interactive = TRUE,
+  prior_count = 2,
+  low_q_threshold = 0.25,
+  high_q_threshold = 0.74,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  rds_dir = "../results/rds_slc6a8_continuous/",
+  table_dir = "../results/tables_slc6a8_continuous/",
+  data_dir = "../data/",
+  fig_dir = "../results/figures_slc6a8_continuous/",
+  msigdb_dir = "../../references/MSigDb_2025.1/"
+)
+
+# Load packages ----------------------------------------------------------------
+library(BiocParallel)
+library(yaml)
+library(DT)
+library(writexl)
+library(unikn)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(pheatmap)
+library(RColorBrewer)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(data.table)
+library(forcats)
+library(scales)
+library(factoextra)
+library(ggridges)
+library(reshape2)
+library(matrixStats)
+library(readxl)
+library(SingleCellExperiment)
+library(MuSiC)
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+if(!dir.exists(params$rds_dir)) dir.create(params$rds_dir, recursive = TRUE)
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir, recursive = TRUE)
+if(!dir.exists(params$table_dir)) dir.create(params$table_dir, recursive = TRUE)
+```
+
+# Load data
+
+```{r}
+dge_red <- readRDS("../results/rds_slc6a8_continuous/expression_set.rds")
+dat_aml_bm <- readRDS("../data/AML_scAtlas_subset.rds")
+library(zellkonverter)
+library(Seurat)
+```
+
+# Prepare data
+
+## Build fine-grained reference labels for the Bone Marrow single-cell reference
+
+```{r}
+cd_bm <- as.data.frame(colData(dat_aml_bm))
+
+cd_bm$fine_label <- dplyr::case_when(
+  !is.na(cd_bm$HSPC.Cell.Type) & cd_bm$HSPC.Cell.Type %in% aml_like_types ~
+    as.character(cd_bm$HSPC.Cell.Type),
+  TRUE ~ as.character(cd_bm$cell_type)
+)
+
+colData(dat_aml_bm)$fine_label <- cd_bm$fine_label
+
+table(dat_aml_bm$fine_label, useNA = "ifany")
+```
+
+# CIBERSORTx
+
+## Procedure on the web portal
+
+### Bulk mixture files
+
+```{r}
+gene_map_bm <- as.data.frame(rowData(dat_aml_bm)) %>%
+  select(ensembl_id = 1, gene_symbol) %>%
+  distinct()
+
+gene_map_bm <- data.frame(
+  ensembl_id  = rownames(dat_aml_bm),
+  gene_symbol = rowData(dat_aml_bm)$gene_symbol,
+  stringsAsFactors = FALSE
+) %>% distinct()
+
+gene_map <- (gene_map_bm) %>%
+  distinct(ensembl_id, .keep_all = TRUE)
+```
+
+```{r}
+library(edgeR)
+library(dplyr)
+
+cpm_mat <- edgeR::cpm(dge_red$counts, log = FALSE)
+
+symbol_map <- gene_map[match(rownames(cpm_mat), gene_map$ensembl_id), "gene_symbol"]
+cpm_df <- as.data.frame(cpm_mat) %>%
+  mutate(GeneSymbol = symbol_map) %>%
+  filter(!is.na(GeneSymbol)) %>%
+  group_by(GeneSymbol) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>% as.data.frame()
+
+bm_samples <- dge_red$samples$OriginalSampleName
+
+write.table(cpm_df[, c("GeneSymbol", bm_samples)],
+            file.path(params$table_dir, "mixture_BM.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+### Single-cell reference files
+
+```{r}
+library(SingleCellExperiment)
+library(Matrix)
+
+export_sc_reference <- function(sce, label_col, gene_map, out_path, max_cells_per_class = 100) {
+  counts_mat <- assay(sce, "counts")
+  labels <- colData(sce)[[label_col]]
+
+  set.seed(1)
+  keep_idx <- unlist(lapply(split(seq_along(labels), labels), function(idx) {
+    sample(idx, size = min(length(idx), max_cells_per_class))
+  }))
+  counts_mat <- counts_mat[, keep_idx]
+  labels <- as.character(labels[keep_idx])
+
+  symbol_map <- gene_map$gene_symbol[match(rownames(counts_mat), gene_map$ensembl_id)]
+  keep_genes <- !is.na(symbol_map)
+  counts_mat <- counts_mat[keep_genes, ]
+  symbol_map <- symbol_map[keep_genes]
+
+  dense <- as.matrix(counts_mat)
+  collapsed <- rowsum(dense, group = symbol_map)
+  colnames(collapsed) <- labels
+
+  out <- data.frame(GeneSymbol = rownames(collapsed), collapsed,
+                     check.names = FALSE, stringsAsFactors = FALSE)
+
+  write.table(out, out_path, sep = "\t", quote = FALSE, row.names = FALSE)
+}
+
+export_sc_reference(dat_aml_bm, "fine_label", gene_map,
+                    file.path(params$table_dir, "reference_BM.txt"))
+```
+
+# Sessioninfo
+
+```{r}
+sessionInfo()
+```
+

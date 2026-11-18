@@ -1,0 +1,787 @@
+---
+title: "TCGA-LAML cohort analysis;\nSLC6A8 DE (continuous predictor) — validation of BeatAML2 findings"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed                  = 12435,
+  workers               = 4,
+  interactive           = TRUE,
+  prior_count           = 2,
+  low_q_threshold       = 0.25,
+  high_q_threshold      = 0.74,
+  gene_fdr_threshold    = 0.05,
+  pathway_fdr_threshold = 0.05,
+  blast_threshold       = 20,
+  run_gsea              = TRUE,
+  rds_dir               = "../results/rds_slc6a8_continuous/",
+  table_dir             = "../results/tables_slc6a8_continuous/",
+  data_dir              = "../data/",
+  se_rds                = "../results/rds/se_tcga.rds",
+  fig_dir               = "../results/figures_slc6a8_continuous/",
+  msigdb_dir            = "../../references/MSigDb_2025.1/"
+)
+
+# Load packages ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(BiocParallel)
+  library(yaml)
+  library(DT)
+  library(writexl)
+  library(yulab.utils)
+  library(edgeR)
+  library(limma)
+  library(SummarizedExperiment)
+  library(unikn)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+  library(dplyr)
+  library(data.table)
+  library(forcats)
+  library(scales)
+  library(factoextra)
+  library(ggridges)
+  library(car)
+  library(reshape2)
+  library(matrixStats)
+  library(kableExtra)
+  library(clusterProfiler)
+})
+
+# Load functions ---------------------------------------------------------------
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+if(!dir.exists(params$rds_dir)) dir.create(params$rds_dir, recursive = TRUE)
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir, recursive = TRUE)
+if(!dir.exists(params$table_dir)) dir.create(params$table_dir, recursive = TRUE)
+
+de_table_cols <- c(
+  "GENEID", "Symbol", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+shiny_path <- file.path(
+  params$rds_dir, "shiny", "rds"
+)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+```
+
+# Load data
+
+```{r load-data}
+se <- readRDS(params$se_rds)
+
+gnes <- as.data.frame(rowData(se))
+gnes <- gnes %>%
+  dplyr::transmute(
+    GENEID = gene_id,
+    Symbol = gene_name,
+    SYMBOL = gene_name,
+    DESCRIPTION = NA_character_,
+    gene_type = gene_type
+  )
+rownames(gnes) <- gnes$GENEID
+
+library(org.Hs.eg.db)
+desc_map <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys      = gnes$GENEID,
+  column    = "GENENAME",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+gnes$DESCRIPTION <- unname(desc_map[gnes$GENEID])
+
+cat("Gene types breakdown (pre-filter):\n")
+print(table(gnes$gene_type))
+
+pc_genes <- gnes$GENEID[gnes$gene_type == "protein_coding"]
+cat(sprintf("Restricting from %d to %d protein-coding genes\n",
+            nrow(gnes), length(pc_genes)))
+
+se <- se[pc_genes, ]
+gnes <- gnes[pc_genes, ]
+
+meta_clinic <- as.data.frame(colData(se))
+
+cnts_aml <- assay(se, "unstranded")
+storage.mode(cnts_aml) <- "integer"
+
+grp <- data.frame(
+  OriginalSampleName = colnames(cnts_aml),
+  Condition = rep("AML", ncol(cnts_aml)),
+  colData(se)
+)
+
+dge <- DGEList(counts = cnts_aml,
+                samples = grp,
+                genes = gnes)
+rownames(dge$genes) <- rownames(gnes)
+rownames(dge) <- rownames(gnes)
+
+tpm_aml <- assay(se, "tpm_unstranded")
+
+gene_sets <- readRDS(file.path(params$msigdb_dir, "msigdb_v2025.1.Hs_gene_sets.rds"))
+```
+
+# Blast counts
+
+```{r}
+perc_blasts = 80
+
+blast_p <- data.frame(
+  blast_pct = meta_clinic$BM_BLAST_PERCENTAGE,
+  row.names = rownames(meta_clinic)
+)
+
+blast_p$include <- ifelse(blast_p$blast_pct > 80, TRUE, FALSE)
+
+ggplot(blast_p, aes(x = '', y = blast_pct)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(aes(color = include), width = 0.15, size = 1, alpha = 0.4) +
+  theme_bw() +
+  ylim(c(0,100)) +
+ggplot(blast_p, aes(x = blast_pct)) +
+  geom_histogram(aes(color=include)) +
+  theme_bw() +
+  xlim(c(0,100))
+```
+
+```{r}
+dge <- dge[, blast_p$include == TRUE]
+```
+
+# Extract SLC6A8 expression
+
+```{r}
+pseudo_idx <- which(dge$genes$GENEID == "ENSG00000268982")
+if (length(pseudo_idx) > 0) {
+  dge <- dge[-pseudo_idx, ]
+}
+```
+
+```{r}
+gene_col <- "GENEID"
+gene <- c("ENSG00000130821")
+ridx <- which(dge$genes[[gene_col]] %in% gene)
+stopifnot(length(ridx) == 1)
+
+slc6a8_expr <- list()
+slc6a8_expr$raw <- dge$counts[ridx, ]
+
+slc6a8_geneid <- rownames(dge)[dge$genes$GENEID == "ENSG00000130821"]
+slc6a8_expr$norm <- edgeR::cpm(dge, log = TRUE, prior.count = 2)[slc6a8_geneid, ]
+slc6a8_expr$norm_tpm <- tpm_aml[rownames(dge$genes)[ridx], ]
+```
+
+# Check potential confounders
+
+```{r}
+covariate <- meta_clinic[, c("FLT3_ITD", "FLT3_TKD", "NPM1", "RUNX1", "ASXL1", "TP53",
+                              "BM_BLAST_PERCENTAGE", "gender", "age_at_diagnosis",
+                              "cyto_risk_group", "fab_category")]
+covariate$id <- rownames(covariate)
+
+for (v in c("FLT3_ITD", "FLT3_TKD", "NPM1", "RUNX1", "ASXL1", "TP53")) {
+  covariate[[v]] <- factor(ifelse(covariate[[v]] == 1, "positive", "negative"),
+                            levels = c("negative", "positive"))
+}
+covariate$gender <- factor(covariate$gender)
+covariate$cyto_risk_group <- factor(covariate$cyto_risk_group)
+covariate$fab_category <- factor(covariate$fab_category)
+
+covariate <- covariate[match(names(slc6a8_expr$raw), covariate$id), ]
+```
+
+```{r}
+na_placeholders <- c("not available", "not classified")
+
+recode_na_placeholders <- function(x, placeholders = na_placeholders) {
+  is_fac <- is.factor(x)
+  x_chr  <- as.character(x)
+  stripped <- tolower(trimws(gsub("[][]", "", x_chr)))
+  hit <- stripped %in% placeholders
+  x_chr[hit] <- NA
+  if (is_fac) factor(x_chr) else x_chr
+}
+
+target_cols <- c("cyto_risk_group", "fab_category")
+
+covariate[target_cols]   <- lapply(covariate[target_cols],   recode_na_placeholders)
+dge$samples[target_cols] <- lapply(dge$samples[target_cols], recode_na_placeholders)
+
+covariate$BM_BLAST_PERCENTAGE <- as.numeric(covariate$BM_BLAST_PERCENTAGE)
+covariate$age_at_diagnosis <- as.numeric(covariate$age_at_diagnosis)
+dge$samples$BM_BLAST_PERCENTAGE <- as.numeric(dge$samples$BM_BLAST_PERCENTAGE )
+dge$samples$age_at_diagnosis <- as.numeric(dge$samples$age_at_diagnosis)
+```
+
+```{r }
+ASSAY <- "norm"
+covariate$slc6a8 <- slc6a8_expr[[ASSAY]][covariate$id]
+
+na_summary <- sort(colMeans(is.na(covariate)) * 100, decreasing = TRUE)
+cat("Percentage NA values:")
+print(round(na_summary[na_summary > 0], 1))
+
+cont_vars <- c("age_at_diagnosis", "BM_BLAST_PERCENTAGE")
+cat_vars  <- c("FLT3_ITD", "FLT3_TKD", "NPM1", "RUNX1", "ASXL1", "TP53",
+               "gender", "cyto_risk_group", "fab_category")
+
+cont_titles <- c(
+  age_at_diagnosis    = "Age at diagnosis",
+  BM_BLAST_PERCENTAGE = "% BM blasts"
+)
+cat_titles <- c(
+  FLT3_ITD        = "FLT3-ITD",
+  FLT3_TKD        = "FLT3-TKD",
+  NPM1            = "NPM1",
+  RUNX1           = "RUNX1",
+  ASXL1           = "ASXL1",
+  TP53            = "TP53",
+  gender          = "Sex",
+  cyto_risk_group = "Cytogenetic risk group",
+  fab_category    = "FAB category"
+)
+
+cor_tests <- lapply(cont_vars, function(v) {
+  cor.test(covariate$slc6a8, covariate[[v]], method = "spearman", use = "complete.obs")
+})
+names(cor_tests) <- cont_vars
+
+cor_estimates <- sapply(cor_tests, function(ct) unname(ct$estimate))
+cor_pvals     <- sapply(cor_tests, function(ct) ct$p.value)
+
+cat("Continuous covariates; Spearman rho with SLC6A8:\n")
+print(round(sort(abs(cor_estimates), decreasing = TRUE), 3))
+cat("Continuous covariates; Spearman p-value with SLC6A8:\n")
+print(signif(sort(cor_pvals), 3))
+
+kw_results <- sapply(cat_vars, function(v) {
+  grp <- covariate[[v]]
+  if (length(unique(na.omit(grp))) < 2) return(NA_real_)
+  kruskal.test(covariate$slc6a8 ~ grp)$p.value
+})
+cat("Categorical covariates; Kruskal-Wallis p-value:\n")
+print(signif(sort(kw_results), 3))
+
+format_pval_sci <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  sprintf("p = %.2e", p)
+}
+```
+
+# Filtering
+
+```{r}
+stopifnot(all(colnames(dge) == covariate$id))
+
+dge$samples$slc6a8_raw  <- slc6a8_expr$raw[colnames(dge)]
+dge$samples$slc6a8_norm <- slc6a8_expr$norm[colnames(dge)]
+
+dge$samples$slc6a8_log2 <- log2(dge$samples$slc6a8_raw + 1)
+
+stopifnot(all(rownames(dge$samples) == rownames(covariate)))
+dge$samples$FLT3_ITD    <- covariate$FLT3_ITD
+dge$samples$NPM1        <- covariate$NPM1
+dge$samples$BM_BLAST_PERCENTAGE <- covariate$BM_BLAST_PERCENTAGE
+dge$samples$gender      <- covariate$gender
+dge$samples$cyto_risk_group <- covariate$cyto_risk_group
+dge$samples$fab_category    <- covariate$fab_category
+dge$samples$age         <- covariate$age_at_diagnosis
+
+dge <- calcNormFactors(dge, method = "TMM")
+
+keep <- filterByExpr(dge, min.count = 10, min.total.count = 15)
+dge_filt <- dge[keep, , keep.lib.sizes = FALSE]
+cat(sprintf("Genes retained: %d / %d\n", sum(keep), length(keep)))
+```
+
+```{r}
+na_mask <- complete.cases(dge_filt$samples[, c(
+  "slc6a8_norm", "FLT3_ITD", "NPM1","BM_BLAST_PERCENTAGE"
+)])
+cat(sprintf("Samples dropped due to NA: %d\n", sum(!na_mask)))
+
+if(all(na_mask)){
+  dge_red <- dge_filt
+} else {
+  dge_red <- dge_filt[, na_mask, keep.lib.sizes = FALSE]
+}
+s <- dge_red$samples
+cat(sprintf("Final n = %d samples, %d genes\n", ncol(dge_red), nrow(dge_red)))
+```
+
+# QC
+
+```{r}
+slc6a8_pal <- colorRampPalette(c("#4E79A7", "#F0F0F0", "#E15759"))(100)
+
+cyto_cols <- setNames(
+  RColorBrewer::brewer.pal(max(3, nlevels(dge_red$samples$cyto_risk_group)), "Set2")[seq_len(nlevels(dge_red$samples$cyto_risk_group))],
+  levels(dge_red$samples$cyto_risk_group)
+)
+
+logcpm <- edgeR::cpm(dge_red, log = TRUE, prior.count = 2)
+s        <- dge_red$samples
+
+ridx <- which(dge$genes[[gene_col]] %in% gene)
+slc6a8_expr$raw <- dge_red$counts[ridx, ]
+slc6a8_geneid <- rownames(dge_red)[dge_red$genes$GENEID == "ENSG00000130821"]
+slc6a8_expr$norm <- logcpm[slc6a8_geneid, ]
+slc6a8_expr$norm_tpm <- tpm_aml[rownames(dge_red$genes)[ridx], ]
+
+stopifnot(all(rownames(s) == names(slc6a8_expr$norm )))
+s$slc6a8_norm <- slc6a8_expr$norm
+
+dge_red_norm <-  list(counts = logcpm,
+                samples = dge_red$samples,
+                genes = dge_red$genes)
+```
+
+## PCA {.tabset}
+
+```{r fig.height=4, fig.width=9, results='asis'}
+top_var  <- order(rowVars(logcpm), decreasing = TRUE)[1:2000]
+pca      <- prcomp(t(logcpm[top_var, ]), scale. = FALSE, center = TRUE)
+pct_var  <- round(100 * summary(pca)$importance[2, 1:4], 1)
+
+pca_df <- data.frame(
+  PC1     = pca$x[, 1],
+  PC2     = pca$x[, 2],
+  PC3     = pca$x[, 3],
+  sample  = rownames(s),
+  slc6a8  = slc6a8_expr$norm,
+  FLT3_ITD = s$FLT3_ITD,
+  NPM1    = s$NPM1,
+  BM_BLAST_PERCENTAGE = s$BM_BLAST_PERCENTAGE,
+  cyto_risk_group = s$cyto_risk_group,
+  fab_category = s$fab_category
+)
+
+for (VAR in colnames(pca_df[, -c(1:4)])){
+
+  cat("###", VAR, "\n\n")
+
+  p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = .data[[VAR]])) +
+    geom_point(size = 3, alpha = 0.8) +
+    theme_classic() +
+    labs(
+      colour = VAR,
+       x = sprintf("PC1 (%.1f%%)", pct_var[1]),
+       y = sprintf("PC2 (%.1f%%)", pct_var[2])
+    )
+  if (VAR %in% c("slc6a8", "BM_BLAST_PERCENTAGE")) {
+    p_pca <- p_pca + scale_colour_gradient2(
+      low = "#4E79A7", mid = "grey", high = "#E15759",
+      midpoint = median(pca_df[[VAR]], na.rm = TRUE)
+    )
+  } else {
+    p_pca <- p_pca + scale_colour_discrete(na.translate = FALSE)
+  }
+
+  p_pca2 <- ggplot(pca_df, aes(x = PC2, y = PC3, colour = .data[[VAR]])) +
+    geom_point(size = 3, alpha = 0.8) +
+    theme_classic() +
+    labs(
+      colour = VAR,
+       x = sprintf("PC2 (%.1f%%)", pct_var[2]),
+       y = sprintf("PC3 (%.1f%%)", pct_var[3])
+    )
+  if (VAR %in% c("slc6a8", "BM_BLAST_PERCENTAGE")) {
+    p_pca2 <- p_pca2 + scale_colour_gradient2(
+      low = "#4E79A7", mid = "grey", high = "#E15759",
+      midpoint = median(pca_df[[VAR]], na.rm = TRUE)
+    )
+  } else {
+    p_pca2 <- p_pca2 + scale_colour_discrete(na.translate = FALSE)
+  }
+
+  print(p_pca + p_pca2)
+  cat("\n\n")
+}
+```
+
+## Pairwise correlation
+
+```{r fig.height=5, fig.width=8}
+set.seed(42)
+idx_cor  <- sample(nrow(logcpm), min(3000, nrow(logcpm)))
+cor_mat  <- cor(logcpm[idx_cor, ], method = "spearman")
+
+ann_col <- data.frame(
+  SLC6A8  = slc6a8_expr$norm,
+  FLT3    = s$FLT3_ITD,
+  NPM1    = s$NPM1,
+  row.names = colnames(cor_mat)
+)
+
+ann_colors <- list(
+  SLC6A8 = slc6a8_pal,
+  FLT3   = c(positive = "#E15759", negative = "#A0CBE8"),
+  NPM1   = c(positive = "#F28E2B", negative = "#D3D1C7")
+)
+
+pheatmap(
+  cor_mat,
+  color             = colorRampPalette(c("#4E79A7", "white", "#E15759"))(100),
+  breaks            = seq(0.7, 1.0, length.out = 101),
+  annotation_col    = ann_col,
+  annotation_colors = ann_colors,
+  show_rownames     = FALSE,
+  show_colnames     = FALSE,
+  treeheight_row    = 30,
+  treeheight_col    = 30,
+  clustering_method = "ward.D2",
+  border_color      = NA,
+  fontsize          = 9,
+  main              = "Sample-to-sample Spearman correlation (top 3000 variable genes) — TCGA-LAML"
+)
+```
+
+# Differential Expression
+
+## Design matrix
+
+```{r }
+design <- model.matrix(
+  ~ slc6a8_norm + FLT3_ITD + NPM1 + BM_BLAST_PERCENTAGE,
+  data = s
+)
+
+cat("Design matrix dimensions:", dim(design), "\n")
+cat("Coefficient of interest: 'slc6a8_norm' (log2 and library size CPM normalized counts)\n")
+cat("All coefficients:\n"); print(colnames(design))
+```
+
+## QC
+
+### Voom plot
+
+```{r}
+v <- voom(dge_red, design, plot = TRUE)
+```
+
+## Mean-variance trend after correction
+
+```{r}
+fit  <- lmFit(v, design)
+fit  <- eBayes(fit, trend = TRUE, robust = TRUE)
+
+plotSA(fit, main = "Mean-variance trend after eBayes — TCGA-LAML")
+```
+
+## Results summary
+
+```{r}
+fdr_thr  <- 0.05
+lfc_thr  <- 1
+
+res <- topTable(
+  fit,
+   coef      = "slc6a8_norm",
+  number     = Inf,
+  adjust.method = "BH",
+  sort.by    = "P"
+)
+
+res$SYMBOL <- ifelse(is.na(res$SYMBOL) | res$SYMBOL == "",
+                     rownames(res), res$SYMBOL)
+res$neg_log10_p <- -log10(res$P.Value)
+res$neg_log10_fdr <- -log10(res$adj.P.Val)
+
+res$direction <- case_when(
+  res$adj.P.Val < fdr_thr & res$logFC >  0 ~ "up",
+  res$adj.P.Val < fdr_thr & res$logFC < 0 ~ "down",
+  TRUE                                             ~ "ns"
+)
+res$direction <- factor(res$direction, levels = c("up", "down", "ns"))
+
+diffexp_gene_table <-   res |>
+    dplyr::filter(adj.P.Val < 0.05) |>
+    mutate(Direction = case_when(
+      logFC > 0 ~ "Up",
+      TRUE ~ "Down"
+    )) |>
+    summarise(N = n(), .by = Direction) |>
+    mutate(Contrast = "SLC6A8") |>
+  pivot_wider(id_cols = Contrast, names_from = Direction, values_from = N)
+
+kable(diffexp_gene_table)
+```
+
+## Log-fold change interpretation
+
+```{r}
+iqr_slc6a8 <- IQR(dge_red$samples$slc6a8_norm)
+
+res$logFC_per_IQR <- res$logFC * iqr_slc6a8
+res$raw_logFC = res$logFC
+res$logFC = res$logFC_per_IQR
+```
+
+```{r fig.width=10, fig.height=10}
+iqr_slc6a8_norm   <- IQR(dge_red$samples$slc6a8_norm)
+lfc_thr_raw       <- 1 / iqr_slc6a8_norm
+
+res$direction <- case_when(
+  res$adj.P.Val < fdr_thr & res$logFC_per_IQR >  1 ~ "up",
+  res$adj.P.Val < fdr_thr & res$logFC_per_IQR < -1 ~ "down",
+  TRUE                                              ~ "ns"
+)
+res$direction <- factor(res$direction, levels = c("up", "down", "ns"))
+
+plot_df <- data.frame(
+  logFC         = res$raw_logFC,
+  logFC_per_IQR = res$logFC_per_IQR,
+  direction     = res$direction,
+  SYMBOL        = res$SYMBOL,
+  adj.P.Val     = res$adj.P.Val
+)
+
+genes_highlight <- c("SLC6A8")
+top_lab <- bind_rows(
+  plot_df |> filter(direction == "up")   |> slice_max(logFC_per_IQR, n = 1),
+  plot_df |> filter(direction == "down")  |> slice_min(logFC_per_IQR, n = 1),
+  plot_df |> filter(SYMBOL %in% genes_highlight)
+) |> distinct()
+
+dir_cols <- c(up = "#E15759", down = "#4E79A7", ns = "grey80")
+
+p_main <- ggplot(plot_df,
+                 aes(x = logFC, y = logFC_per_IQR, colour = direction)) +
+  geom_point(size = 0.7, alpha = 0.4) +
+  geom_point(data = top_lab, size = 3.1, alpha = 1) +
+  geom_text_repel(
+    data         = top_lab,
+    aes(label    = SYMBOL),
+    size         = 3.8,
+    max.overlaps = 30,
+    segment.size = 0.3,
+    colour       = "black"
+  ) +
+  geom_hline(yintercept = c(-2, -1, 0, 1, 2),
+             linetype   = "dashed", linewidth = 0.35, colour = "grey50") +
+  geom_vline(xintercept = c(-2, -1, 0, 1, 2) / iqr_slc6a8_norm,
+             linetype   = "dashed", linewidth = 0.35, colour = "grey50") +
+  geom_hline(yintercept = c(-1, 1),
+             linetype = "solid", linewidth = 0.5, colour = "grey20") +
+  annotate("text",
+           x = 1 / iqr_slc6a8_norm, y = max(plot_df$logFC_per_IQR) * 0.3,
+           label = sprintf("raw logFC = %.3f\n→ IQR logFC = 1 (2-fold)",
+                           1 / iqr_slc6a8_norm),
+           hjust = -0.05, size = 4.8, colour = "#E15759") +
+  annotate("text",
+           x = -1 / iqr_slc6a8_norm, y = min(plot_df$logFC_per_IQR) * 0.3,
+           label = sprintf("raw logFC = %.3f\n→ IQR logFC = −1 (½-fold)",
+                           -1 / iqr_slc6a8_norm),
+           hjust = 1.05, size = 4.8, colour = "#4E79A7") +
+  scale_colour_manual(values = dir_cols, name = NULL) +
+  labs(
+    title    = "Raw logFC vs. IQR-scaled logFC",
+    subtitle = sprintf(
+      "y = x × IQR  |  IQR of SLC6A8 (CQN log2) = %.2f log2 units  |  slope = %.2f",
+      iqr_slc6a8_norm, iqr_slc6a8_norm),
+    x = "Raw logFC \n(per 1 log2 unit increase in SLC6A8)",
+    y = sprintf("logFC per IQR \n(per %.2f log2 unit increase in SLC6A8)",
+                iqr_slc6a8_norm)
+  ) +
+  theme_bw(base_size = 16) +
+  theme(legend.position = "top")
+
+p_raw_dens <- ggplot(plot_df, aes(x = logFC, fill = direction)) +
+  geom_histogram(bins = 80, colour = "white", linewidth = 0.15) +
+  geom_vline(xintercept = c(-1, 0, 1) / iqr_slc6a8_norm,
+             linetype = "dashed", linewidth = 0.4, colour = "grey40") +
+  scale_fill_manual(values = dir_cols, name = NULL) +
+  labs(title = "Distribution of raw logFC",
+       subtitle = "Dashed lines = raw equivalents of IQR logFC −1, 0, +1",
+       x = "Raw logFC", y = "Gene count") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "none")
+
+p_iqr_dens <- ggplot(plot_df, aes(x = logFC_per_IQR, fill = direction)) +
+  geom_histogram(bins = 80, colour = "white", linewidth = 0.15) +
+  geom_vline(xintercept = c(-2, -1, 0, 1, 2),
+             linetype = "dashed", linewidth = 0.6, colour = "grey40") +
+  annotate("text", x = c(-2, -1, 1, 2),
+           y = Inf, vjust = 2, size = 4.6,
+           label = c("4-fold\nlower", "2-fold\nlower",
+                     "2-fold\nhigher", "4-fold\nhigher")) +
+  scale_fill_manual(values = dir_cols, name = NULL) +
+  labs(title = "Distribution of IQR-scaled logFC",
+       subtitle = "Dashed lines at interpretable fold-change",
+       x = sprintf("logFC per IQR (%.2f log2 units)", iqr_slc6a8_norm),
+       y = "Gene count") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "none")
+
+(p_main) /
+(p_raw_dens + p_iqr_dens) +
+  plot_annotation(
+    title   = "Relationship between raw and IQR-scaled logFC",
+    caption = sprintf(
+      "IQR = %.2f log2 units | raw logFC threshold = %.3f | n = %d genes | Significant (FDR < 0.05, |logFC/IQR| > 1): %d",
+      iqr_slc6a8_norm, lfc_thr_raw, nrow(plot_df), sum(plot_df$direction != "ns")
+    )
+  )
+```
+
+## Results table
+
+```{r results='asis'}
+write.table(
+  res,
+  file.path(params$table_dir, "diffexp_SLC6A8.txt"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+num_cols <- names(res)[vapply(res, is.numeric, logical(1))]
+
+print(htmltools::tagList(datatable(res[1:min(100, nrow(res)),],
+                                       extensions = "Buttons", options = list(
+                                         dom = "Bfrtip",
+                                         buttons = c("copy", "csv", "excel")
+                                       )) %>%
+                           formatRound(
+                            columns = setdiff(num_cols, c("P.Value", "adj.P.Val")),
+                            digits = 3
+                          ) %>%
+                          formatSignif(
+                            columns = c("P.Value", "adj.P.Val"),
+                            digits = 3
+                          )
+                         ))
+```
+
+# Pathway enrichment analysis
+
+```{r}
+ranked_list <- res$t
+names(ranked_list) <- res$GENEID
+ranked_list <- sort(ranked_list, decreasing = TRUE)
+
+ranked_list <- ranked_list[!is.na(ranked_list)]
+ranked_list <- ranked_list[!duplicated(names(ranked_list))]
+
+ranked_list <- ranked_list[-which(names(ranked_list) == gene)]
+
+collections_keep <- c(
+  "H", "C2:CGP", "C2:CP:KEGG_LEGACY", "C2:CP:REACTOME",
+  "C2:CP:WIKIPATHWAYS", "C5:GO:BP", "C7:IMMUNESIGDB"
+)
+
+gene_sets_filt <- gene_sets[gene_sets$collection_name %in% collections_keep, ]
+
+term2gene <- gene_sets_filt |>
+  as.data.frame() |>
+  tidyr::unnest(cols = ensembl) |>
+  dplyr::select(gs_name = geneset_name, ensembl_gene = ensembl) |>
+  dplyr::filter(ensembl_gene %in% names(ranked_list)) |>
+  as.data.frame()
+
+term2name <- gene_sets_filt |>
+  as.data.frame() |>
+  dplyr::select(gs_name = geneset_name, description_brief) |>
+  dplyr::distinct() |>
+  as.data.frame()
+```
+
+```{r}
+gsea_res_txt <- file.path(params$table_dir, "gsea_all.txt")
+if(!file.exists(gsea_res_txt)){
+
+  set.seed(42)
+
+  gsea_res <- GSEA(
+    geneList     = ranked_list,
+    TERM2GENE    = term2gene,
+    TERM2NAME    = term2name,
+    eps          = 0,
+    minGSSize    = 15,
+    maxGSSize    = 500,
+    pvalueCutoff = 0.05,
+    pAdjustMethod = "BH",
+    verbose      = FALSE
+  )
+  saveRDS(gsea_res, file = file.path(params$rds_dir, "gsea_output.rds"))
+
+  gsea_res <- gsea_res %>% as.data.frame()
+
+  gsea_res$collection_name <- gene_sets_filt$collection_name[match(gsea_res$ID, gene_sets_filt$geneset_name)]
+  gsea_res$Ngenes <- lengths(strsplit(gsea_res$core_enrichment, "/", fixed = TRUE))
+  gsea_res$fractionOverlap <- gsea_res$Ngenes/ gsea_res$setSize
+  core_enrichment <- data.frame("ID" = gsea_res$ID, "core_enrichment" =  gsea_res$core_enrichment)
+  gsea_res$core_enrichment <- NULL
+  gsea_res$leading_edge <- NULL
+
+  write.table(gsea_res, file.path(params$table_dir, "gsea_all.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+  write_xlsx(gsea_res, file.path(params$table_dir, "gsea_all.xlsx"))
+  write_xlsx(gsea_res |> dplyr::filter(p.adjust < 0.05), file.path(params$table_dir, "gsea_sig.xlsx"))
+  write.table(core_enrichment, file.path(params$table_dir, "gsea_core_enrichment.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+} else {
+
+  gsea_res <- fread(gsea_res_txt) %>% as.data.frame()
+  rownames(gsea_res) <- gsea_res$ID
+
+  core_enrichment <- fread(file.path(params$table_dir, "gsea_core_enrichment.txt")) %>% as.data.frame()
+}
+```
+
+## Enrichment score dotplot
+
+```{r}
+saveRDS(dge_red, file = file.path(params$rds_dir, "expression_set.rds"))
+saveRDS(dge_red_norm, file = file.path(params$rds_dir, "expression_set_normalized.rds"))
+
+saveRDS(pca_df, file = file.path(params$rds_dir, "pca.rds"))
+saveRDS(cor_mat, file = file.path(params$rds_dir, "correlation_matrix.rds"))
+saveRDS(fit, file = file.path(params$rds_dir, "limma_results.rds"))
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

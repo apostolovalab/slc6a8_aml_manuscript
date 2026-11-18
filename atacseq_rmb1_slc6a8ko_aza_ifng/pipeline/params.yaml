@@ -1,0 +1,18 @@
+input:                 'pipeline/samplesheet_nfcore.csv'
+outdir:                'results'
+
+# reference
+fasta:                 'data/ref/GRCm39.primary_assembly.genome.fa.gz'
+gtf:                   'data/ref/gencode.vM35.primary_assembly.annotation.gtf.gz'
+blacklist:             'data/ref/mm39-blacklist.v2.liftover.bed'
+mito_name:             'chrM'
+ataqv_mito_reference:  'chrM'
+save_reference:        true
+read_length:           50
+
+# alignment / filtering
+aligner:               'bowtie2'
+
+# peaks
+narrow_peak:           true
+min_reps_consensus:    2

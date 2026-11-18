@@ -1,0 +1,328 @@
+---
+title: "RMB-1 SLC6A8 KO ATAC-seq — differential accessibility"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(txdbmaker);
+  library(DiffBind); library(edgeR); library(ChIPseeker)
+  library(GenomicRanges); library(rtracklayer); library(matrixStats)
+ library(dplyr);
+  library(tidyr); library(stringr); library(purrr)
+  library(tibble); library(readr)
+  library(ggplot2); library(ggrepel); library(patchwork); library(pheatmap);
+  library(DT); library(unikn)
+})
+
+make_txdb <- if (requireNamespace("txdbmaker", quietly = TRUE)) {
+  txdbmaker::makeTxDbFromGFF
+} else {
+  GenomicFeatures::makeTxDbFromGFF
+}
+
+source("../../scripts/functions.R", local = TRUE)
+
+params <- list(
+  res_dir = "../results",
+  gtf = "../data/ref/gencode.vM35.primary_assembly.annotation.gtf.gz",
+  aligner = "bowtie2",
+  fdr = 0.05,
+  flank = 25000,
+  n_cores = 8,
+  recount = FALSE,
+  blacklist = "../data/ref/mm39-blacklist.v2.liftover.bed"
+)
+```
+
+```{r}
+ml_dir    <- file.path(params$res_dir, params$aligner, "merged_library")
+peak_dir  <- file.path(ml_dir, "macs2", "narrow_peak")
+mr_bw_dir <- file.path(params$res_dir, params$aligner, "merged_replicate", "bigwig")
+
+out_tab  <- file.path(params$res_dir, "tables", "diffbind")
+out_rds  <- file.path(params$res_dir, "rds",    "diffbind")
+out_plot <- file.path(params$res_dir, "plots",  "diffbind")
+walk(c(out_tab, out_rds, out_plot), dir.create, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Sample sheet
+
+```{r results='asis'}
+# ---- Build DiffBind sample sheet from pipeline outputs ----
+build_sample_sheet <- function(ml_dir, peak_dir) {
+  tibble(bamReads = list.files(ml_dir, pattern = "\\.mLb\\.clN\\.sorted\\.bam$",
+                               full.names = TRUE)) |>
+    mutate(SampleID = str_remove(basename(bamReads), "\\.mLb\\.clN\\.sorted\\.bam$"),
+           Peaks    = file.path(peak_dir, paste0(SampleID, ".mLb.clN_peaks.narrowPeak"))) |>
+    extract(SampleID, into = c("Condition", "Replicate"),
+            regex = "^(.+)_REP(\\d+)$", remove = FALSE, convert = TRUE) |>
+    mutate(Factor     = str_extract(Condition, "^[^_]+"),
+           Treatment  = str_remove(Condition, "^[^_]+_"),
+           PeakCaller = "narrow") |>
+    dplyr::select(SampleID, Condition, Factor, Treatment, Replicate, bamReads, Peaks, PeakCaller)
+}
+
+dbo_file <- file.path(out_rds, "dba_counted.rds")
+if (!params$recount && file.exists(dbo_file)) {
+  ss <- as_tibble(readRDS(dbo_file)$samples) |>
+    dplyr::select(SampleID, Condition, Factor, Treatment, Replicate, bamReads, Peaks, PeakCaller) |>
+    mutate(Replicate = as.integer(Replicate))
+} else {
+  ss <- build_sample_sheet(ml_dir, peak_dir)
+
+  # ---- Checks ----
+  stopifnot(nrow(ss) == 24,
+            all(file.exists(ss$Peaks)),
+            all(file.exists(paste0(ss$bamReads, ".bai"))))
+}
+
+ko_label   <- setdiff(unique(ss$Factor), "NTC")
+stopifnot(length(ko_label) == 1)
+treat_lvls <- c("VEH", "AZA", "AZA_IFNg")
+group_lvls <- as.vector(t(outer(c("NTC", ko_label), treat_lvls, paste, sep = "_")))
+
+ss <- ss |>
+  mutate(Factor    = factor(Factor, levels = c("NTC", ko_label)),
+         Treatment = factor(Treatment, levels = treat_lvls),
+         Condition = factor(Condition, levels = group_lvls)) |>
+  arrange(Treatment, Factor, Replicate)
+
+ss <- ss %>%
+  filter_out(SampleID == "NTC_AZA_IFNg_REP2")
+
+ print(htmltools::tagList(
+    default_dt(
+      ss
+    )))
+```
+
+# Consensus peaks and counting (DiffBind)
+
+```{r results='asis'}
+dbo_file <- file.path(out_rds, "dba_counted.rds")
+
+if (!params$recount && file.exists(dbo_file)) {
+  dbo <- readRDS(dbo_file)
+} else {
+  dbo <- dba(sampleSheet = as.data.frame(ss))
+  dbo$config$cores     <- params$n_cores
+  dbo$config$singleEnd <- FALSE
+
+  # ---- Remove peaks overlapping the (lifted) mm39 blacklist; no greylist (no controls) ----
+  dbo <-   dba.blacklist(dbo, blacklist = import(params$blacklist), greylist = FALSE)
+
+  # ---- Consensus: >=2 replicates within any condition ----
+  dbo_cons   <- dba.peakset(dbo, consensus = DBA_CONDITION, minOverlap = 2)
+  dbo_cons   <- dba(dbo_cons, mask = dbo_cons$masks$Consensus, minOverlap = 1)
+  cons_peaks <- dba.peakset(dbo_cons, bRetrieve = TRUE)
+
+  # ---- Count fragments on summit-centred windows ----
+  dbo <- dba.count(dbo, peaks = cons_peaks, summits = 200,
+                   score = DBA_SCORE_READS, bParallel = TRUE)
+  saveRDS(dbo, dbo_file)
+}
+
+info = dba.show(dbo)
+info$PeakReads <- round(info$Reads * info$FRiP)
+print(htmltools::tagList(
+  default_dt(
+    info
+  )))
+```
+
+# Count matrix and edgeR model
+
+```{r}
+# ---- Extract raw counts + peak GRanges from DiffBind ----
+get_counts <- function(dbo, sample_order) {
+  pk  <- dba.peakset(dbo, bRetrieve = TRUE, DataType = DBA_DATA_FRAME)
+  ids <- paste0(pk$CHR, ":", pk$START, "-", pk$END)
+  cnt <- as.matrix(pk[, sample_order])
+  rownames(cnt) <- ids
+  gr <- GRanges(pk$CHR, IRanges(pk$START, pk$END), peak_id = ids)
+  list(counts = round(cnt), peaks = gr)
+}
+
+cnt_obj <- get_counts(dbo, ss$SampleID)
+```
+
+```{r}
+# ---- edgeR QL fit: ~ 0 + group ----
+group  <- factor(as.character(ss$Condition), levels = group_lvls)
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+y <- DGEList(counts = cnt_obj$counts, group = group)
+keep <- filterByExpr(y, design)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y, method = "TMM")
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design, robust = TRUE)
+
+peaks_gr <- cnt_obj$peaks[cnt_obj$peaks$peak_id %in% rownames(y)]
+
+plotBCV(y)
+```
+
+# Differential accessibility: KO vs NTC per treatment
+
+```{r}
+# ---- Contrasts ----
+contr_def  <- set_names(paste0(ko_label, "_", treat_lvls, " - NTC_", treat_lvls),
+                        paste0(ko_label, "_vs_NTC_", treat_lvls))
+contr_mat  <- makeContrasts(contrasts = contr_def, levels = design)
+colnames(contr_mat) <- names(contr_def)
+contr_mat
+```
+
+```{r warning=FALSE}
+# ---- Peak annotation (ChIPseeker, GENCODE) ----
+txdb     <- txdbmaker::makeTxDbFromGFF(params$gtf, format = "gtf")
+genes_gr <- import(params$gtf, format = "gtf", feature.type = "gene")
+gene_map <- as_tibble(mcols(genes_gr)) |> distinct(gene_id, gene_name, gene_type)
+
+anno_tbl <- annotatePeak(peaks_gr, TxDb = txdb, tssRegion = c(-1000, 1000),
+                         level = "gene", verbose = FALSE) |>
+  as.data.frame() |>
+  as_tibble() |>
+  transmute(peak_id, seqnames, start, end,
+            annotation = str_remove(annotation, " \\(.*$"),
+            gene_id = geneId, dist_tss = distanceToTSS) |>
+  left_join(gene_map, by = "gene_id")
+```
+
+```{r}
+# ---- Run QL F-tests ----
+run_contrast <- function(fit, contr_vec, anno_tbl) {
+  glmQLFTest(fit, contrast = contr_vec) |>
+    topTags(n = Inf, sort.by = "none") |>
+    as.data.frame() |>
+    rownames_to_column("peak_id") |>
+    as_tibble() |>
+    left_join(anno_tbl, by = "peak_id") |>
+    arrange(PValue)
+}
+
+res_list <- map(set_names(colnames(contr_mat)),
+                ~ run_contrast(fit, contr_mat[, .x], anno_tbl))
+
+res_all <- bind_rows(res_list, .id = "contrast") |>
+  mutate(contrast = factor(contrast, levels = colnames(contr_mat)),
+         sig = case_when(FDR < params$fdr & logFC > 1 ~ "Up",
+                         FDR < params$fdr & logFC < -1 ~ "Down",
+                         TRUE ~ "NS"))
+
+# ---- Save ----
+iwalk(res_list, ~ write_csv(.x, file.path(out_tab, paste0("DA_", .y, ".csv"))))
+write_csv(res_all, file.path(out_tab, "DA_all_contrasts_long.csv"))
+saveRDS(list(y = y, fit = fit, contrasts = contr_mat, res = res_list),
+        file.path(out_rds, "edger_fit_results.rds"))
+```
+
+```{r}
+library(ComplexUpset)
+```
+
+# Genes lookout
+
+```{r}
+# ---- Target gene list ----
+targets <- tribble(
+  ~gene_name, ~class,
+  "Ccl2",  "immune activation",
+  "Ccl4",  "immune activation",
+  "Ccl7",  "immune activation",
+  "Ccl12",  "immune activation",
+  "Cybb", "immune activation",
+  "Cd40",    "immune activation",
+  "Cd80",    "immune activation",
+  "Cd86",    "immune activation",
+  "S100a8",  "immune activation",
+  "S100a9", "immune activation",
+
+  "Ciita",   "antigen presentation",
+  "Cd74",    "antigen presentation",
+  "Rfx5",    "antigen presentation",
+  "Rfxap",   "antigen presentation",
+  "Rfxank",  "antigen presentation",
+  "H2-Aa",   "antigen presentation",
+  "H2-Ab1",  "antigen presentation",
+  "H2-Ea",   "antigen presentation",
+  "H2-Eb1",  "antigen presentation",
+  "H2-DMa",  "antigen presentation",
+  "H2-DMb1", "antigen presentation",
+  "H2-DMb2", "antigen presentation",
+  "H2-Oa",   "antigen presentation",
+  "H2-Ob",   "antigen presentation",
+  "H2-Q7", "antigen presentation",
+  "Ctse",  "antigen presentation",
+  "Ctss",  "antigen presentation",
+
+  "Slc6a8", "SLC6A8"
+) |>
+  mutate(class = factor(class, levels = unique(class)))
+kableExtra::kable(targets)
+```
+
+## DA results {.tabset}
+
+```{r}
+# ---- Peaks within gene +/- flank, with signed distance to TSS ----
+build_target_table <- function(peaks_gr, genes_gr, targets, flank) {
+  tg   <- genes_gr[genes_gr$gene_name %in% targets$gene_name]
+  hits <- findOverlaps(peaks_gr, tg + flank)
+  tss  <- start(resize(tg, width = 1, fix = "start"))
+  sgn  <- ifelse(as.character(strand(tg)) == "-", -1, 1)
+  q <- queryHits(hits); s <- subjectHits(hits)
+
+  tibble(peak_id     = peaks_gr$peak_id[q],
+         gene_name   = tg$gene_name[s],
+         dist_tss_kb = (mid(ranges(peaks_gr))[q] - tss[s]) * sgn[s] / 1e3) |>
+    left_join(targets, by = "gene_name")
+}
+
+target_peaks <- build_target_table(peaks_gr, genes_gr, targets, params$flank)
+
+target_res <- target_peaks |>
+  left_join(res_all |> select(contrast, peak_id, logFC, logCPM, PValue, FDR, sig),
+            by = "peak_id", relationship = "many-to-many") |>
+  mutate(gene_name = factor(gene_name, levels = rev(targets$gene_name)),
+         promoter  = abs(dist_tss_kb) <= 1)
+
+write_csv(target_res, file.path(out_tab, "DA_target_genes.csv"))
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+

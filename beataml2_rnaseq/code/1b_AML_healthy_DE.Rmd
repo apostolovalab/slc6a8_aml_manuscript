@@ -1,0 +1,307 @@
+---
+title: "BeatAML2 differential expression"
+subtitle: "AML vs Healthy"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+params:
+  seed: 12435
+  workers: 4
+  interactive: TRUE
+  prior_count: 2
+  gene_fdr_threshold: 0.05
+  pathway_fdr_threshold: 0.05
+  rds_dir: ../results/rds_AML_healthy/
+  table_dir: ../results/tables_AML_healthy/
+  data_dir: ../data/
+  fig_dir: ../results/figures_AML_healthy/
+  msigdb_dir: "../../references/MSigDb_2025.1/"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+# Load packages ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(BiocParallel)
+  library(yaml)
+  library(DT)
+  library(writexl)
+  library(edgeR)
+  library(limma)
+  library(unikn)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+  library(dplyr)
+  library(data.table)
+
+})
+
+# Load functions ---------------------------------------------------------------
+source("../../scripts/functions.R", local = TRUE)
+source("../../scripts/GSEA_camera.R")
+source("../../scripts/makeFitObject.R")
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+
+de_table_cols <- c(
+  "GENEID", "SYMBOL", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+shiny_path <- file.path(
+  params$rds_dir, "shiny", "rds"
+)
+```
+
+# Load data
+
+```{r load-data}
+dat <- as.data.frame(fread(file.path(params$data_dir, "beataml_waves1to4_counts_dbgap.txt")))
+meta_clinic <- fread(file.path(params$data_dir, "beataml_wv1to4_clinical.csv"))
+meta_sample <- fread(file.path(params$data_dir, "beataml_waves1to4_sample_mapping.csv"))
+cnts <- as.matrix(dat[, grep("BA", colnames(dat))])
+
+meta_clinic <- meta_clinic[meta_clinic$dbgap_rnaseq_sample %in% colnames(cnts) &
+                             meta_clinic$dxAtInclusion == "ACUTE MYELOID LEUKAEMIA (AML) AND RELATED PRECURSOR NEOPLASMS", ]
+cnts_aml <- cnts[, colnames(cnts) %in% meta_clinic$dbgap_rnaseq_sample ]
+meta_clinic <- meta_clinic[match(colnames(cnts_aml), meta_clinic$dbgap_rnaseq_sample), ]
+meta_sample <- meta_sample[meta_sample$dbgap_rnaseq_sample %in% colnames(cnts) &
+                             meta_sample$rna_control ==  "Healthy pooled CD34+"]
+cnts_healthy <- cnts[, colnames(cnts) %in% meta_sample$dbgap_rnaseq_sample]
+meta_sample <- meta_sample[match(colnames(cnts_healthy), meta_sample$dbgap_rnaseq_sample), ]
+
+grp <- data.frame(
+  OriginalSampleName = c(colnames(cnts_aml), colnames(cnts_healthy)),
+  Condition = c(rep("AML", ncol(cnts_aml)), rep("Healthy", ncol(cnts_healthy)) ),
+  sex = "NA",
+  CellLine = "NA",
+  SampleGroup =  c(rep("AML", ncol(cnts_aml)), rep("Healthy", ncol(cnts_healthy)) )
+)
+grp$Condition <- factor(grp$Condition, levels = c("Healthy", "AML"))
+grp$SampleGroup <- factor(grp$SampleGroup, levels = c("Healthy", "AML"))
+
+gnes <- data.frame(
+  Symbol = dat$display_label,
+  GENEID = dat$stable_id,
+  DESCRIPTION = dat$description,
+  SYMBOL = dat$display_label
+)
+
+rownames(gnes) <- gnes$GENEID
+
+dge <-  DGEList(counts = cbind(cnts_aml, cnts_healthy),
+                samples =grp,
+                genes = gnes)
+rownames(dge$genes) <- dge$genes$GENEID
+rownames(dge) <- dge$genes$GENEID
+
+gene_sets <- readRDS(file.path(params$msigdb_dir, "msigdb_v2025.1.Hs_gene_sets.rds"))
+```
+
+# Create design matrix
+
+```{r design}
+moma <- model.matrix(~ 0 + SampleGroup, data = dge$samples)
+colnames(moma) <- sub("SampleGroup", "", colnames(moma))
+```
+
+# Transform and filter data
+
+```{r filter-transform-counts}
+dge <- dge[filterByExpr(dge, design = moma), , keep.lib.sizes = FALSE]
+dge <- dge[filterByExpr(dge), , keep.lib.sizes = FALSE]
+```
+
+# Calculate normalization factors and dispersions
+
+```{r calculate-norm-factors-dispersions}
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge, design = moma)
+log2cpm <- cpm(dge, log = TRUE, prior.count = params$prior_count)
+```
+
+# Create contrasts
+
+```{r contrasts}
+contrast_vec <- c("AML__vs__Healthy" = "AML - Healthy")
+
+cntrs <- makeContrasts(
+  contrasts = contrast_vec,
+  levels = moma
+)
+colnames(cntrs) <- names(contrast_vec)
+```
+
+# Fit model and contrasts
+
+```{r contrast-fit}
+fits <- map(
+  colnames(cntrs),
+  ~ perform_contrast_fit_edgeR(fit, .x, cntrs)
+) |> rlang::set_names(colnames(cntrs))
+```
+
+# GSEA analysis
+
+```{r}
+rownames(dge) <- dge$genes$GENEID
+```
+
+```{r gsea}
+collections <- unique(sort(gene_sets$collection_name)) |>
+  rlang::set_names()
+
+fits <- map(fits, ~ add_camera_stats(.x, eset = dge))
+
+gsea_res <- map(collections, function(co, gene_sets) {
+  gs <- as.list(gene_sets[gene_sets$collection_name == co, "ensembl"])
+  map(fits, ~ perform_gsea(.x, gs))
+}, gene_sets = gene_sets, .progress = params$interactive)
+```
+
+# Heme synthesis
+
+```{r}
+library(GSVA)
+library(msigdbr)
+```
+
+## Enrichment score
+
+```{r export-gsea-tables, eval=params$run_gsea}
+gsea_res_dfr <- lapply(names(gsea_res), function(x) {
+  lapply(names(gsea_res[[x]]), function(y) {
+    gsea_res[[x]][[y]] |>
+      tibble::rownames_to_column(var = "Pathway") |>
+      mutate(Contrast = y, .before = 1) |>
+      mutate(MsigDb = x, .before = 1)
+  }) |>
+    bind_rows()
+}) |>
+  bind_rows()
+
+write.table(
+  gsea_res_dfr,
+  file.path(
+    params$table_dir,
+    paste0("gsea_all.txt")
+  ),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+write_xlsx(
+  gsea_res_dfr,
+  file.path(
+    params$table_dir,
+    paste0("gsea_all.xlsx")
+  )
+)
+
+write_xlsx(
+  gsea_res_dfr |>
+    dplyr::filter(FDR < params$pathway_fdr_threshold),
+  file.path(
+    params$table_dir,
+    paste0("gsea_sig.xlsx")
+  )
+)
+```
+
+```{r export-for-shiny, eval=params$run_gsea}
+if (!dir.exists(shiny_path)) {
+  dir.create(shiny_path, recursive = TRUE)
+}
+
+saveRDS(dge, file = file.path(shiny_path, "expression_set.rds"))
+
+log2cpm <- cpm(dge, log = TRUE, prior.count = params$prior_count)
+iqrs <- apply(log2cpm, 1, IQR)
+varCut <- 0.75
+sel <- iqrs > quantile(iqrs, varCut)
+pca <- prcomp(
+  scale(t(scale(t(log2cpm[sel, ]), scale = FALSE)), scale = FALSE),
+  center = FALSE
+)
+saveRDS(pca, file = file.path(shiny_path, "expression_set_pca.rds"))
+
+cor_df <- expression_set_correlation(log2cpm)
+saveRDS(
+  cor_df,
+  file = file.path(shiny_path, "expression_set_correlation.rds")
+)
+
+saveRDS(fits, file = file.path(shiny_path, "limma_results.rds"))
+
+saveRDS(
+  makeFitObject(fits),
+  file = file.path(shiny_path, "limma_results_shiny.rds")
+)
+
+description_details <- c(
+  "AML vs Healthy samples"
+)
+
+cn_descr <- data.frame(
+  row.names = names(fits),
+  description = if (exists("description_details") && !is.null(description_details)) {
+    description_details
+  } else {
+    contrast_vec
+  },
+  coefficient = "",
+  stringsAsFactors = FALSE
+)
+
+saveRDS(
+  cn_descr,
+  file = file.path(shiny_path, "contrast_description.rds")
+)
+
+if (any(lapply(gsea_res, length) > 0)) {
+  saveRDS(
+    gsea_res,
+    file = file.path(shiny_path, "camera_results.rds")
+  )
+}
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
+

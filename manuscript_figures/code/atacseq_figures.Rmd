@@ -1,0 +1,485 @@
+---
+title: "Manuscript figures — ATAC-seq accessibility at target loci"
+subtitle: "Creatine Manuscript"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(GenomicRanges)
+library(rtracklayer)
+library(Rsamtools)
+library(GenomicAlignments)
+library(Biostrings)
+library(SummarizedExperiment)
+library(edgeR)
+library(TFBSTools)
+library(monaLisa)
+library(GenomeInfoDb)
+library(writexl)
+
+params <- list(
+  target_csv  = "../../atacseq_rmb1_slc6a8ko_aza_ifng/results/tables/diffbind/DA_target_genes.csv",
+  fig_dir     = "../results/figures/atacseq_rmb1/",
+  fdr         = 0.05,
+  edger_rds    = "../../atacseq_rmb1_slc6a8ko_aza_ifng/results/rds/diffbind/edger_fit_results.rds",
+  class_rds    = "../../atacseq_rmb1_slc6a8ko_aza_ifng/results/rds/motifs/monalisa_class_all_contrasts.rds",
+  bam_dir      = "../../atacseq_rmb1_slc6a8ko_aza_ifng/results/bowtie2/merged_library",
+  genome_fa    = "../../atacseq_rmb1_slc6a8ko_aza_ifng/results/genome/GRCm39.primary_assembly.genome.fa",
+  gtf          = "../../atacseq_rmb1_slc6a8ko_aza_ifng/data/ref/gencode.vM35.primary_assembly.annotation.gtf.gz",
+  groups       = c("NTC_AZA_IFNg", "KO_AZA_IFNg"),
+  ciita_flank  = 25000,
+  cd40_flank   = 10000,
+  bin_width    = 50,
+  min_score    = 10,
+  track_motifs = c("STAT1", "Irf1", "STAT1::STAT2"),
+  piv_peak     = "chr16:10307383-10307783",
+  heat_motifs  = c("STAT1::STAT2", "Stat2", "Irf1", "IRF3", "IRF8",
+                   "RELA", "NFKB1", "NFKB2", "RFX5")
+)
+
+dir.create(params$fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Differential accessibility
+
+## Peak-level accessibility at costimulatory and MHC-II loci
+
+```{r}
+# ---- Load peak x gene x contrast table from the DA report ----
+target_res <- read_csv(params$target_csv, show_col_types = FALSE)
+str(target_res)
+
+# ---- Selected genes; each peak kept only under its nearest TSS (H2 windows overlap) ----
+genes_pub <- tribble(
+  ~gene_name, ~class,
+  "Cd40",   "Co-st.",
+  "Cd80",   "Co-st.",
+  "Ciita",   "MHC-II",
+  "H2-Aa",  "MHC-II",
+  "H2-Ab1", "MHC-II",
+  "H2-Ea", "MHC-II",
+  "H2-Eb1", "MHC-II")
+
+tr_pub <- target_res |>
+  filter(gene_name %in% genes_pub$gene_name) |>
+  select(-class) |>
+  left_join(genes_pub, by = "gene_name") |>
+  group_by(peak_id, contrast) |>
+  slice_min(abs(dist_tss_kb), n = 1, with_ties = FALSE) |>
+  ungroup()
+
+tr_pub |> distinct(peak_id, gene_name) |> dplyr::count(gene_name)
+```
+
+```{r, fig.width = 6.7, fig.height = 4.4}
+# ---- Plot: one point per peak, KO vs NTC log2FC per condition ----
+prom_lab    <- "Promoter (\u00b11 kb)"
+sig_lab     <- paste("FDR <", params$fdr)
+cond_labels <- c(VEH = "Vehicle", AZA = "AZA", AZA_IFNg = "AZA + IFN-\u03b3")
+
+plot_df <- tr_pub |>
+  mutate(condition = factor(cond_labels[str_remove(contrast, "^.*_vs_NTC_")], levels = cond_labels),
+         class     = factor(class, levels = unique(genes_pub$class)),
+         gene_name = factor(gene_name, levels = rev(genes_pub$gene_name)),
+         sig       = factor(if_else(FDR < params$fdr, sig_lab, "n.s."), levels = c(sig_lab, "n.s.")),
+         region    = factor(if_else(promoter, prom_lab, "Distal"), levels = c(prom_lab, "Distal"))) |>
+  arrange(desc(region))
+
+lim <- max(1, ceiling(max(abs(plot_df$logFC)) * 2) / 2)
+
+p_targets <- ggplot(plot_df, aes(logFC, gene_name)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_point(aes(shape = region, size = region, fill = sig),
+             colour = "grey20", stroke = 0.4,
+             position = position_jitter(width = 0, height = 0.18, seed = 1)) +
+  facet_grid(class ~ condition, scales = "free_y", space = "free_y") +
+  scale_shape_manual(values = setNames(c(23, 21), c(prom_lab, "Distal"))) +
+  scale_size_manual(values = setNames(c(5, 3), c(prom_lab, "Distal"))) +
+  scale_fill_manual(values  = setNames(c("#B2182B", "grey85"), c(sig_lab, "n.s."))) +
+  scale_x_continuous(limits = c(-lim, lim), breaks = c(-1, 0, 1)) +
+  guides(
+  fill  = guide_legend(override.aes = list(shape = 21, size = 4)),
+  shape = guide_legend(override.aes = list(fill = "grey85"))
+) +
+  labs(x = expression(log[2]~"fold change (KO / NTC)"), y = NULL,
+       shape = NULL, size = NULL, fill = NULL) +
+  theme_bw(base_size = 20) +
+  theme(axis.text.y        = element_text(face = "italic", colour = "black" ),
+          strip.background   = element_blank(),
+          strip.text         = element_text(face = "bold"),
+          panel.grid.minor   = element_blank(),
+          panel.grid.major.y = element_line(colour = "grey92"),
+          legend.position    = "bottom")
+
+p_targets
+```
+
+```{r}
+# ---- Save PDF + register figure metadata ----
+f_targets <- file.path(params$fig_dir, "ATAC_targets_peak_logFC_dotplot.pdf")
+ggsave(f_targets, p_targets, width = 6.7, height = 4.5, device = cairo_pdf)
+```
+
+# Motif enrichment
+
+## Inputs
+
+```{r}
+# ---- Shared style ----
+pal_geno  <- c(NTC = "grey45", KO = "#B2182B")
+pal_motif <- c(STAT1 = "#E69F00", Irf1 = "#0072B2", `STAT1::STAT2` = "#009E73")
+
+theme_pub <- theme_classic(base_size = 12) +
+  theme(axis.line        = element_line(linewidth = 0.3),
+        axis.ticks       = element_line(linewidth = 0.3),
+        strip.background = element_blank(),
+        legend.key.size  = unit(3, "mm"),
+        plot.title       = element_text(size = 9, face = "bold"))
+```
+
+```{r}
+stopifnot(file.exists(c(params$edger_rds, params$class_rds, params$genome_fa, params$gtf)))
+
+edger_obj <- readRDS(params$edger_rds)
+cls_se    <- readRDS(params$class_rds)
+fa        <- FaFile(params$genome_fa)
+gtf       <- import(params$gtf, format = "gtf", feature.type = c("gene", "transcript", "exon"))
+
+# ---- BAMs of the samples used in the DA ----
+bam_files <- list.files(params$bam_dir, pattern = "\\.mLb\\.clN\\.sorted\\.bam$", full.names = TRUE)
+names(bam_files) <- str_remove(basename(bam_files), "\\.mLb\\.clN\\.sorted\\.bam$")
+bam_files <- bam_files[colnames(edger_obj$y)]
+stopifnot(!anyNA(bam_files))
+
+# ---- Consensus peaks and track PWMs (from the monaLisa results) ----
+all_peaks <- GRanges(edger_obj$res[[1]]$peak_id)
+all_peaks$peak_id <- edger_obj$res[[1]]$peak_id
+
+pwm_all   <- rowData(cls_se[[1]])$motif.pwm
+track_pwm <- pwm_all[map_chr(as.list(pwm_all), name) %in% params$track_motifs]
+```
+
+```{r}
+# ---- TMM-scaled coverage, averaged per group ----
+get_tmm_coverage <- function(region, y, bam_files, groups, bin_width) {
+  chr  <- as.character(seqnames(region))
+  bins <- keepSeqlevels(tile(region, width = bin_width)[[1]], chr, pruning.mode = "coarse")
+  smp  <- tibble(sample  = colnames(y),
+                 group   = as.character(y$samples$group),
+                 eff_lib = y$samples$lib.size * y$samples$norm.factors) |>
+    filter(group %in% groups)
+
+  pmap(smp, \(sample, group, eff_lib) {
+    frag <- readGAlignmentPairs(bam_files[[sample]], param = ScanBamParam(which = region)) |>
+      granges(on.discordant.seqnames = "drop")
+    b <- binnedAverage(bins, coverage(frag)[chr], "cov")
+    tibble(group = group, start = start(b), end = end(b), score = b$cov * 1e6 / eff_lib)
+  }) |>
+    bind_rows() |>
+    summarise(score = mean(score), .by = c(group, start, end)) |>
+          mutate(genotype  = factor(str_extract(group, "^[^_]+"), levels = c("NTC", "KO")),
+           group_lab = group |>
+             str_replace_all("_", " ") |>
+             str_replace("AZA IFNg", "AZA \n+ IFN-y") |>
+             str_replace("^NTC", "CTRL"),
+           group_lab = factor(group_lab, levels = unique(group_lab[order(match(group, groups))])))
+}
+
+# ---- Motif sites in consensus peaks of a region ----
+get_locus_motifs <- function(region, peaks, pwm, fa, min_score) {
+  pk   <- subsetByOverlaps(peaks, region)
+  seqs <- getSeq(fa, pk)
+  names(seqs) <- pk$peak_id
+  hits <- findMotifHits(query = pwm, subject = seqs, min.score = min_score, method = "matchPWM")
+  tibble(peak_id = as.character(seqnames(hits)),
+         motif   = as.character(hits$pwmname),
+         score   = hits$score,
+         mid     = (start(hits) + end(hits)) / 2) |>
+    mutate(gpos = start(pk)[match(peak_id, pk$peak_id)] + mid - 1)
+}
+
+# ---- Locus figure: coverage / gene model / motif sites ----
+plot_locus <- function(cov, gene_tbl, ex_tbl, mot, x_lim, chr, strand, prom = NULL) {
+  prom_layer <- if (!is.null(prom))
+    geom_vline(data = prom, aes(xintercept = tss), linetype = 2, linewidth = 0.3, colour = "grey50")
+  x_scale  <- scale_x_continuous(labels = \(x) sprintf("%.2f", x / 1e6), expand = c(0, 0))
+  gm_rows  <- distinct(gene_tbl, label, y)
+  y_top    <- max(gm_rows$y) + 0.9
+
+  p_cov <- ggplot(cov) +
+    geom_rect(aes(xmin = start, xmax = end, ymin = 0, ymax = score, fill = genotype)) +
+    prom_layer +
+    scale_fill_manual(values = pal_geno, guide = "none") +
+    facet_grid(group_lab ~ ., switch = "y") +
+    x_scale + coord_cartesian(xlim = x_lim) +
+    labs(x = NULL, y = "Signal (TMM)") +
+    theme_pub +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.line.x = element_blank(),
+          strip.placement = "outside", strip.text.y.left = element_text(angle = 0, hjust = 1))
+
+  p_gene <- ggplot() +
+    geom_segment(data = filter(gene_tbl, !body), aes(x = start, xend = end, y = y, yend = y),
+                 colour = "grey50", linewidth = 0.3) +
+    geom_segment(data = filter(gene_tbl, body), aes(x = start, xend = end, y = y, yend = y),
+                 colour = "grey20", linewidth = 0.6,
+                 arrow = arrow(length = unit(1.5, "mm"), ends = if (strand == "-") "first" else "last")) +
+    geom_rect(data = ex_tbl, aes(xmin = start, xmax = end, ymin = y - 0.25, ymax = y + 0.25), fill = "grey20") +
+    prom_layer +
+    { if (!is.null(prom)) geom_text(data = prom, aes(x = tss, y = y_top, label = promoter, hjust = hjust), size = 3.3) } +
+    scale_y_continuous(breaks = gm_rows$y, labels = gm_rows$label,
+                       limits = c(0.5, y_top + 0.5), expand = c(0, 0)) +
+    x_scale + coord_cartesian(xlim = x_lim) +
+    labs(x = NULL, y = NULL) +
+    theme_pub +
+    theme(axis.text.x = element_blank(), axis.ticks = element_blank(), axis.line = element_blank())
+
+  p_mot <- ggplot(mot, aes(gpos, motif, size = score, colour = motif)) +
+    geom_point(alpha = 0.8) +
+    prom_layer +
+    scale_size_continuous(range = c(1, 4), name = "PWM\nscore") +
+    scale_colour_manual(values = pal_motif, guide = "none") +
+    x_scale + coord_cartesian(xlim = x_lim) +
+    labs(x = paste0(chr, " (Mb)"), y = NULL) +
+    theme_pub
+
+  p_cov / p_gene / p_mot +
+    plot_layout(heights = c(3, 0.4 + 0.3 * nrow(gm_rows), 1))
+}
+```
+
+## Ciita locus
+
+```{r, fig.width = 5, fig.height = 4.2}
+# ---- Promoters: TSS clusters of transcripts splicing into the common exon 2 ----
+ciita     <- gtf[which(gtf$gene_name == "Ciita")]
+ciita_ex  <- ciita[ciita$type == "exon"]
+ex2       <- ciita_ex[as.character(ciita_ex$exon_number) == "2"]
+ex2_start <- start(resize(ex2, 1, fix = "start"))
+tx_main   <- ex2$transcript_id[ex2_start == as.integer(names(which.max(table(ex2_start))))]
+
+tss  <- resize(ciita_ex[as.character(ciita_ex$exon_number) == "1" & ciita_ex$transcript_id %in% tx_main],
+               1, fix = "start")
+prom <- GenomicRanges::reduce(tss, min.gapwidth = 500, with.revmap = TRUE)
+prom <- prom[order(start(prom))]
+stopifnot(length(prom) == 3, all(strand(prom) == "+"))
+
+prom_tx  <- map_chr(as.list(prom$revmap), \(i) paste(unique(tss$transcript_name[i]), collapse = ","))
+
+prom_tbl <- tibble(promoter    = c("pI", "pIII", "pIV"),
+                   tss         = start(prom),
+                   transcripts = prom_tx,
+                   hjust       = c(0.5, 1.15, -0.15))
+
+# ---- Gene model: gene body (collapsed exons) + one row per promoter isoform ----
+ciita_body <- range(ciita[ciita$type == "transcript"])
+tx_prom    <- prom_tbl |>
+  select(promoter, transcript_name = transcripts) |>
+  separate_rows(transcript_name, sep = ",") |>
+  mutate(label = paste0(promoter, " (", transcript_name, ")"))
+
+ciita_rows <- tibble(label = c("Ciita", tx_prom$label)) |> mutate(y = rev(seq_along(label)))
+
+ciita_gene_tbl <- bind_rows(
+  tibble(label = "Ciita", start = start(ciita_body), end = end(ciita_body), body = TRUE),
+  as_tibble(ciita[ciita$type == "transcript" & ciita$transcript_name %in% tx_prom$transcript_name]) |>
+    inner_join(tx_prom, by = "transcript_name") |>
+    transmute(label, start, end, body = FALSE)) |>
+  left_join(ciita_rows, by = "label")
+
+ciita_ex_tbl <- bind_rows(
+  as_tibble(GenomicRanges::reduce(ciita_ex)) |> transmute(label = "Ciita", start, end),
+  as_tibble(ciita_ex[ciita_ex$transcript_name %in% tx_prom$transcript_name]) |>
+    inner_join(tx_prom, by = "transcript_name") |>
+    transmute(label, start, end)) |>
+  left_join(ciita_rows, by = "label")
+
+# ---- Region, coverage, motif sites ----
+ciita_region <- GRanges(as.character(seqnames(ciita_body)),
+                        IRanges(start(ciita_body) - params$ciita_flank, end(ciita_body) + 2000))
+
+ciita_cov <- get_tmm_coverage(ciita_region, edger_obj$y, bam_files, params$groups, params$bin_width)
+ciita_mot <- get_locus_motifs(ciita_region, all_peaks, track_pwm, fa, 6)
+
+p_ciita <- plot_locus(ciita_cov, ciita_gene_tbl, ciita_ex_tbl, ciita_mot,
+                      x_lim  = c(start(ciita_region), end(ciita_region)),
+                      chr    = as.character(seqnames(ciita_region)),
+                      strand = as.character(strand(ciita_body)),
+                      prom   = prom_tbl)
+
+ggsave(file.path(params$fig_dir, "ciita_locus.pdf"), p_ciita,
+        width = 5, height = 4.2)
+```
+
+## Cd40 locus
+
+```{r, fig.width = 5, fig.height = 3.6}
+# ---- Gene body only (collapsed exons) ----
+cd40      <- gtf[which(gtf$gene_name == "Cd40")]
+cd40_body <- range(cd40[cd40$type == "gene"])
+
+cd40_gene_tbl <- tibble(label = "Cd40", y = 1, start = start(cd40_body), end = end(cd40_body), body = TRUE)
+cd40_ex_tbl   <- as_tibble(GenomicRanges::reduce(cd40[cd40$type == "exon"])) |>
+  transmute(label = "Cd40", y = 1, start, end)
+
+# ---- Region, coverage, motif sites ----
+cd40_region <- GRanges(as.character(seqnames(cd40_body)),
+                       IRanges(start(cd40_body) - params$cd40_flank, end(cd40_body) + params$cd40_flank))
+
+cd40_cov <- get_tmm_coverage(cd40_region, edger_obj$y, bam_files, params$groups, params$bin_width)
+cd40_mot <- get_locus_motifs(cd40_region, all_peaks, track_pwm, fa, min_score = 6)
+
+p_cd40 <- plot_locus(cd40_cov, cd40_gene_tbl, cd40_ex_tbl, cd40_mot,
+                     x_lim  = c(start(cd40_region), end(cd40_region)),
+                     chr    = as.character(seqnames(cd40_region)),
+                     strand = as.character(strand(cd40_body)))
+
+ggsave(file.path(params$fig_dir, "cd40_locus.pdf"), p_cd40,
+       width = 5, height = 3.6, device = cairo_pdf)
+```
+
+## Ciita pIV accessibility
+
+```{r, fig.width = 4.5, fig.height = 2.8}
+# ---- Per-sample TMM logCPM of the pIV peak ----
+lcpm <- cpm(edger_obj$y, log = TRUE, prior.count = 2)
+trt_lvls <- c("VEH", "AZA", "AZA_IFNg")
+trt_labs <- c("VEH", "AZA", "AZA + IFN-γ")
+
+piv_tbl <- tibble(group = as.character(edger_obj$y$samples$group), logCPM = lcpm[params$piv_peak, ]) |>
+  mutate(genotype  = factor(str_extract(group, "^[^_]+"), levels = c("NTC", "KO")),
+         treatment = factor(str_remove(group, "^[^_]+_"), levels = trt_lvls, labels = trt_labs))
+
+# ---- KO vs NTC FDR per treatment (edgeR QL) ----
+fdr_tbl <- imap(edger_obj$res, \(r, ctr) tibble(contrast = ctr, FDR = r$FDR[r$peak_id == params$piv_peak])) |>
+  bind_rows() |>
+  mutate(treatment = factor(str_remove(contrast, "^KO_vs_NTC_"), levels = trt_lvls, labels = trt_labs),
+         label     = paste0("FDR = ", formatC(FDR, format = "g", digits = 2)))
+
+p_piv <- ggplot(piv_tbl, aes(treatment, logCPM, fill = genotype)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, linewidth = 0.3, alpha = 0.6,
+               position = position_dodge(0.75)) +
+  geom_point(aes(colour = genotype), size = 1.2,
+             position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.75)) +
+  scale_fill_manual(values = pal_geno) +
+  scale_colour_manual(values = pal_geno, guide = "none") +
+  labs(x = NULL, y = "Accessibility (TMM)", fill = NULL, title = "Ciita pIV promoter peak") +
+  theme_classic(base_size = 14) +
+  theme(axis.line        = element_line(linewidth = 0.3),
+        axis.ticks       = element_line(linewidth = 0.3),
+        strip.background = element_blank(),
+        legend.key.size  = unit(5, "mm"),
+        plot.title       = element_text(size = 9, face = "bold")) +
+  theme(legend.position = "right")
+
+p_piv
+
+ggsave(file.path(params$fig_dir, "ciita_pIV_accessibility_boxplots.pdf"), p_piv,
+       width = 4.5, height = 2.8,  device = cairo_pdf)
+```
+
+## Motif enrichment in KO-opened peaks
+
+```{r, fig.width = 5.5, fig.height = 4.5}
+# ---- Up-class enrichment per contrast, selected motifs ----
+heat_tbl <- imap(cls_se, \(se, ctr)
+  tibble(motif_name   = unname(rowData(se)$motif.name),
+         log2enr      = assay(se, "log2enr")[, "Up"],
+         negLog10Padj = assay(se, "negLog10Padj")[, "Up"],
+         contrast     = ctr)) |>
+  bind_rows() |>
+  filter(motif_name %in% params$heat_motifs) |>
+  mutate(motif_name = factor(motif_name, levels = rev(params$heat_motifs)),
+         contrast   = factor(str_remove(contrast, "^KO_vs_NTC_"), levels = trt_lvls, labels = trt_labs),
+         stars      = case_when(negLog10Padj > 3              ~ "***",
+                                negLog10Padj > 2              ~ "**",
+                                negLog10Padj > -log10(0.05)   ~ "*",
+                                TRUE                          ~ ""))
+stopifnot(all(params$heat_motifs %in% heat_tbl$motif_name))
+
+# ---- Logo panel: motif names + sequence logos, rows aligned with the heatmap ----
+pfm_all  <- rowData(cls_se[[1]])$motif.pfm
+logo_pfm <- pfm_all[match(params$heat_motifs, map_chr(as.list(pfm_all), name))]
+n_mot    <- length(params$heat_motifs)
+y_pos    <- rev(seq_len(n_mot))
+max_w    <- max(map_int(as.list(logo_pfm), \(m) ncol(Matrix(m))))
+
+p_logo <- purrr::reduce(seq_len(n_mot), \(p, i)
+  p + annotation_custom(seqLogoGrob(logo_pfm[[i]], xmax = max_w, xjust = "left"),
+                        xmin = 0, xmax = 1, ymin = y_pos[i] - 0.42, ymax = y_pos[i] + 0.42),
+  .init = ggplot(tibble(x = c(0, 1), y = c(0.5, n_mot + 0.5)), aes(x, y)) +
+    geom_blank() +
+    scale_x_continuous(expand = c(0, 0)) +
+    scale_y_continuous(breaks = y_pos, labels = params$heat_motifs,
+                       limits = c(0.5, n_mot + 0.5), expand = c(0, 0)) +
+    labs(x = NULL, y = NULL) +
+    theme_pub +
+    theme(axis.line = element_blank(), axis.ticks = element_blank(), axis.text.x = element_blank()))
+
+# ---- Heatmap ----
+lim <- max(abs(heat_tbl$log2enr))
+
+p_heat <- ggplot(heat_tbl, aes(contrast, motif_name, fill = log2enr)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = stars), size = 4.5, vjust = 0.75) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       limits = c(-lim, lim), name = "log2\nenrichment") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  labs(x = NULL, y = NULL, title = "KO-opened peaks") +
+  theme_classic(base_size = 16) +
+  theme(axis.line        = element_line(linewidth = 0.3),
+        axis.ticks       = element_line(linewidth = 0.3),
+        strip.background = element_blank(),
+        legend.key.size  = unit(4, "mm"),
+        plot.title       = element_text(size = 12, face = "bold")) +
+  theme(axis.text.y = element_blank(), axis.ticks = element_blank(),
+        axis.line = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_motif <- p_logo + p_heat + plot_layout(widths = c(1.3, 1))
+p_motif
+
+ggsave(file.path(params$fig_dir, "motif_enrichment_up.pdf"), p_motif,
+       width = 5.5, height = 4.5, device = cairo_pdf)
+```
+
+# Sessioninfo
+
+```{r}
+sessionInfo()
+```
+

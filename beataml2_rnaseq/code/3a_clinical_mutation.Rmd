@@ -1,0 +1,179 @@
+---
+title: "BeatAML2 cohort analysis;\nFollow-up: Clinical/ mutational data"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+params:
+  seed: 12435
+  workers: 4
+  interactive: TRUE
+  prior_count: 2
+  low_q_threshold: 0.25
+  high_q_threshold: 0.74
+  gene_fdr_threshold: 0.05
+  pathway_fdr_threshold: 0.05
+  rds_dir: ../results/rds_slc6a8_continuous_BETA/
+  table_dir: ../results/tables_slc6a8_continuous_BETA/
+  data_dir: ../data/
+  fig_dir: ../results/figures_slc6a8_continuous_BETA/
+  msigdb_dir: "../../references/MSigDb_2025.1/"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+# Load packages ----------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(BiocParallel)
+  library(yaml)
+  library(DT)
+  library(writexl)
+  library(yulab.utils)
+  library(edgeR)
+  library(limma)
+  library(unikn)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(tibble)
+  library(tidyr)
+  library(knitr)
+  library(stringr)
+  library(purrr)
+  library(dplyr)
+  library(data.table)
+  library(forcats)
+  library(scales)
+  library(factoextra)
+  library(ggridges)
+  library(car)
+  library(reshape2)
+  library(matrixStats)
+  library(kableExtra)
+  library(clusterProfiler)
+  library(readxl)
+  library(GSVA)
+})
+
+# Load functions ---------------------------------------------------------------
+source("../../scripts/functions.R", local = TRUE)
+source("../../scripts/GSEA_camera.R")
+source("../../scripts/makeFitObject.R")
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+if(!dir.exists(params$rds_dir)) dir.create(params$rds_dir, recursive = TRUE)
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir, recursive = TRUE)
+if(!dir.exists(params$table_dir)) dir.create(params$table_dir, recursive = TRUE)
+
+de_table_cols <- c(
+  "GENEID", "Symbol", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+shiny_path <- file.path(
+  params$rds_dir, "shiny", "rds"
+)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+```
+
+# Load data
+
+```{r}
+dge <- readRDS("../results/rds_slc6a8_continuous_BETA/expression_set.rds")
+dge_norm <- readRDS("../results/rds_slc6a8_continuous_BETA/expression_set_normalized.rds")
+
+dge_cat <- readRDS("../results/rds/shiny/rds/expression_set.rds")
+
+fit <- readRDS("../results/rds_slc6a8_continuous_BETA/limma_results.rds")
+res <- fread("../results/tables_slc6a8_continuous_BETA/diffexp_SLC6A8.txt") %>% as.data.frame()
+gsea_res <- fread("../results/tables_slc6a8_continuous_BETA/gsea_all.txt") %>% as.data.frame()
+```
+
+# Clinical variables
+
+## Extracting and transforming
+
+```{r}
+meta_clinic <- fread(file.path(params$data_dir, "beataml_wv1to4_clinical.csv")) %>%
+  as.data.frame()
+meta_sample <- fread(file.path(params$data_dir, "beataml_waves1to4_sample_mapping.csv")) %>%
+  as.data.frame()
+```
+
+```{r}
+meta_subtypes <- meta_clinic[,c("dbgap_rnaseq_sample", "consensusAMLFusions", "ELN2017",
+              "FLT3-ITD", "priorMDS", "priorMDSMPN", "fabBlastMorphology", "priorMPN")]
+meta_subtypes$fabBlastMorphology[meta_subtypes$fabBlastMorphology %in% c("M0", "M6", "M0/M1", "M6a", "M6b")] <-  'M0_6'
+meta_subtypes$fabBlastMorphology[meta_subtypes$fabBlastMorphology %in% c("M5", "M5a", "M5b")] <-  'M5_merged'
+
+cat("Overview of clinical variables:\n")
+sapply(meta_subtypes[,-1], table)
+htmltools::tagList(DT::datatable(data.frame(meta_subtypes),
+                                 filter = "top",
+                                 extensions = "Buttons",
+                               options = list(
+                                 dom = "Bfrtip",
+                                 buttons = c("copy", "csv", "excel"),
+                                 autoWidth = TRUE
+                               )))
+```
+
+```{r}
+merge_meta <- function(dge_obj, meta_subtypes) {
+  idx <- match(rownames(dge_obj$samples), meta_subtypes$dbgap_rnaseq_sample)
+  cols_to_add <- setdiff(colnames(meta_subtypes), "dbgap_rnaseq_sample")
+  dge_obj$samples[cols_to_add] <- meta_subtypes[idx, cols_to_add]
+  dge_obj
+}
+
+dge      <- merge_meta(dge,      meta_subtypes)
+dge_norm <- merge_meta(dge_norm, meta_subtypes)
+dge_cat  <- merge_meta(dge_cat,  meta_subtypes)
+```
+
+```{r}
+library(NMF)
+library(doParallel)
+```
+
+# Export
+
+```{r}
+saveRDS(dge, "../results/rds_slc6a8_continuous/expression_set_clinical.rds")
+saveRDS(dge_norm, "../results/rds_slc6a8_continuous/expression_set_normalized_clinical.rds")
+saveRDS(dge_cat, "../results/rds/shiny/rds/expression_set_clinical.rds")
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

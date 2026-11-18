@@ -1,0 +1,556 @@
+---
+title: "RMB-1 SLC6A8-KO AZA Transcription Factors inference"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  rds_dir = "../results/rds/",
+  table_dir = "../results/tables/",
+  data_dir = "../data/",
+  fig_dir = "../results/figures/",
+  msigdb_dir = "../../references/MSigDb_2025.1/",
+  compar_names = c("VEH", "AZA_Tcells")
+)
+
+# Load packages ----------------------------------------------------------------
+library(BiocParallel)
+library(DT)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(purrr)
+library(dplyr)
+library(data.table)
+library(decoupleR)
+
+# Load functions ---------------------------------------------------------------
+source("../../scripts/functions.R", local = TRUE)
+```
+
+# Load results
+
+## Differential expression results  {.tabset}
+
+```{r}
+dge <- readRDS("../results/rds/dge_object.rds")
+dge_unfilt <- readRDS("../results/rds/dge_unfiltered_object.rds")
+tt_list <- readRDS("../results/rds/contrast_fits_list.rds")
+
+res1 <- fread("../results/tables/diffexp_KO__vs__NTC_Vehicle.txt") %>% as.data.frame()
+res2 <- fread("../results//tables/diffexp_KO__vs__NTC_AZA_Tcells.txt") %>% as.data.frame()
+
+res_list <- list(res1, res2)
+names(res_list) <- params$compar_names
+```
+
+# Load TF - targets data
+
+## `CollecTRI` database
+
+```{r eval=FALSE}
+tbl <- static_table("interactions", "CollecTRI", organism = 10090, strict_evidences = FALSE)
+net <- tbl |>
+  transmute(
+    source = source_genesymbol,
+    target = target_genesymbol,
+    mor    = if_else(is_inhibition == 1, -1, 1)
+  ) |>
+  distinct()
+
+saveRDS(net, file.path(params$data_dir, "collectri_mouse.rds"))
+```
+
+```{r}
+net <- readRDS(file.path(params$data_dir, "collectri_mouse.rds"))
+head(net)
+```
+
+## Stat1
+
+### ChIP-Atlas
+
+```{r }
+chip_stat1 <- fread(file.path(params$data_dir, "Stat1_chipatlas.tsv")) %>% as.data.frame() %>%
+  dplyr::select(c("Target_genes", "Stat1|Average"))
+head(chip_stat1)
+```
+
+```{r}
+v <- chip_stat1$`Stat1|Average`
+
+library(inflection)
+
+v_sorted <- sort(v, decreasing = TRUE)
+x <- seq_along(v_sorted)
+
+knee <- uik(x, v_sorted)
+
+df <- data.frame(index = x, value = v_sorted)
+
+ggplot(df, aes(index, value)) +
+  geom_line(color = "steelblue") +
+  geom_point() +
+  geom_vline(xintercept = knee, color = "red", linetype = "dashed") +
+  annotate("text", x = knee, y = max(v_sorted),
+           label = paste("Knee point=", round(knee)),
+           hjust = -0.1, color = "red") +
+  theme_minimal() +
+  labs(y = "ChIP-Atlas average score")
+```
+
+```{r results='asis'}
+chip_stat1_filt <- chip_stat1[chip_stat1$`Stat1|Average` > v_sorted[knee], ]
+print(htmltools::tagList(
+    default_dt(
+      chip_stat1_filt
+    )
+  ))
+```
+
+```{r}
+net_chip <- data.frame(
+  source = "Stat1_chip",
+  target = chip_stat1_filt$Target_genes,
+  mor = 1
+)
+
+net = rbind(net, net_chip)
+```
+
+### SIGNOR
+
+```{r eval=FALSE}
+## Requires internet access -----------------------------------------------
+
+url <- "https://signor.uniroma2.it/getData.php"
+
+signor_cols <- c(
+  "ENTITYA", "TYPEA", "IDA", "DATABASEA",
+  "ENTITYB", "TYPEB", "IDB", "DATABASEB",
+  "EFFECT", "MECHANISM", "RESIDUE", "SEQUENCE",
+  "TAX_ID", "CELL_DATA", "TISSUE_DATA",
+  "MODULATOR_COMPLEX", "TARGET_COMPLEX",
+  "MODIFICATIONA", "MODASEQ", "MODIFICATIONB", "MODBSEQ",
+  "PMID", "DIRECT", "NOTES", "ANNOTATOR", "SENTENCE",
+  "SIGNOR_ID", "SCORE", "LINKOUT"
+)
+
+resp <- GET(url, query = list(id = "P42225", organism = "10090"))
+stop_for_status(resp)
+
+signor_raw <- read_tsv(
+  content(resp, as = "text", encoding = "UTF-8"),
+  col_names = signor_cols,
+  col_types = cols(.default = "c")
+)
+
+stat1_regulon <- signor_raw %>%
+  filter(ENTITYA == "STAT1",
+         MECHANISM == "transcriptional regulation") %>%
+  mutate(mor = case_when(
+    grepl("up-regulates",   EFFECT) ~ 1,
+    grepl("down-regulates", EFFECT) ~ -1,
+    TRUE ~ NA_real_
+  )) %>%
+  transmute(source = "STAT1",
+            target = ENTITYB,
+            mor,
+            signor_score = as.numeric(SCORE),
+            pmid = PMID)
+write_csv(stat1_regulon, file = file.path(params$data_dir, "stat1_regulons_signor.csv"))
+```
+
+```{r results='asis'}
+stat1_regulon <- fread(file.path(params$data_dir, "stat1_regulons_signor.csv")) %>% as.data.frame() %>%
+  filter(!duplicated(target))
+stat1_regulon$target[stat1_regulon$target == "CIITA"] <- "Ciita"
+stat1_regulon$target[stat1_regulon$target == "SOCS3"] <- "Socs3"
+stat1_regulon$target[stat1_regulon$target == "IRF7"] <- "Irf7"
+stat1_regulon$target[stat1_regulon$target == "SOCS1"] <- "Socs1"
+stat1_regulon$target[stat1_regulon$target == "IL12A"] <- "Il12a"
+stat1_regulon$target[stat1_regulon$target == "IL12B"] <- "Il12b"
+stat1_regulon$target[stat1_regulon$target == "NOS2"] <- "Nos2"
+stat1_regulon$target[stat1_regulon$target == "TLR3"] <- "Tlr3"
+print(htmltools::tagList(
+    default_dt(
+      stat1_regulon
+    )
+  ))
+```
+
+```{r}
+net <- rbind(net,
+             data.frame(source = 'Stat1_signor',
+                        target = stat1_regulon$target,
+                        mor = stat1_regulon$mor))
+```
+
+# Activity inference
+
+```{r}
+contrast_acts <- lapply(res_list, function(res_sub){
+
+  sign_fc <-  data.frame(sign_fc = -log10(res_sub$PValue) * res_sub$logFC)
+  rownames(sign_fc) <- make.unique(res_sub$Symbol)
+
+  decoupleR::run_ulm(mat = sign_fc,
+                    net = net,
+                    .source = 'source',
+                    .target = 'target',
+                    .mor='mor',
+                    minsize = 5)
+
+})
+```
+
+```{r}
+tf_lookup <- res_list$VEH |>
+  distinct(SYMBOL, DESCRIPTION, GENEID) |>
+  filter(SYMBOL %in% unique(net$source))
+library(org.Mm.eg.db)
+
+missing <- setdiff(unique(net$source), tf_lookup$SYMBOL)
+
+extra <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys     = missing,
+  keytype  = "SYMBOL",
+  columns  = c("GENENAME", "ENSEMBL")
+) |>
+  transmute(SYMBOL, DESCRIPTION = GENENAME, GENEID = ENSEMBL) |>
+  distinct(SYMBOL, .keep_all = TRUE)
+
+tf_lookup <- bind_rows(tf_lookup, extra)
+tf_lookup <- tf_lookup |>
+  mutate(DESCRIPTION = coalesce(DESCRIPTION, "complex / unmapped in org.Mm.eg.db"))
+tf_lookup$DESCRIPTION[tf_lookup$SYMBOL == "Stat1_chip"] <- "Stat1 - recovered from ChIP-Atlas"
+tf_lookup$DESCRIPTION[tf_lookup$SYMBOL == "Stat1_signor"] <- "Stat1 - recovered from SIGNOR"
+for(i in names(contrast_acts)){
+  contrast_acts[[i]]$DESCRIPTION <- tf_lookup$DESCRIPTION[match(contrast_acts[[i]]$source, tf_lookup$SYMBOL)]
+  contrast_acts[[i]] <- contrast_acts[[i]] |> relocate(DESCRIPTION, .after = source)
+}
+
+contrast_acts <- lapply(contrast_acts, function(x) {
+  x$padj <- p.adjust(x$p_value, method = "BH")
+  x
+})
+```
+
+## Results summary
+
+```{r}
+library(dplyr); library(tidyr); library(knitr); library(kableExtra)
+
+tf_summary <- bind_rows(contrast_acts, .id = "contrast") |>
+  mutate(contrast = factor(contrast,
+                           levels = c("VEH","AZA_Tcells"))) |>
+  group_by(contrast) |>
+  summarise(
+    n_tested  = n(),
+    Activated = sum(padj < 0.05 & score > 0),
+    Repressed = sum(padj < 0.05 & score < 0),
+    Total     = Activated + Repressed,
+    top_TF    = source[which.min(padj)],
+    top_padj  = formatC(min(padj), format = "e", digits = 1),
+    .groups = "drop"
+  ) |>
+  arrange(contrast)
+
+tf_summary |>
+  kable(
+    caption   = "Significant transcription factor activity per contrast (CollecTRI / decoupleR ULM, KO vs Control, BH FDR < 0.05)",
+    col.names = c("Contrast", "TFs tested", "Activated in KO", "Repressed in KO",
+                  "Total", "Top TF", "Top FDR"),
+    align     = c("l", rep("r", 4), "l", "r"),
+    booktabs  = TRUE
+  ) |>
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped", "hover", "condensed")) |>
+  add_header_above(c(" " = 2, "Significant TFs" = 3, "Strongest hit" = 2)) |>
+  column_spec(3, color = "#B40426") |>
+  column_spec(4, color = "#3B4CC0")
+```
+
+```{r}
+library(RColorBrewer)
+```
+
+# Shared TFs
+
+## Table of shared TFs
+
+```{r results='asis'}
+library(dplyr); library(tidyr); library(ggplot2); library(forcats); library(tibble)
+acts <- bind_rows(contrast_acts, .id = "contrast") |>
+  mutate(contrast = factor(contrast,
+                           levels = c("VEH",  "AZA_Tcells"))) |>
+  group_by(contrast) |>
+  mutate(rank_padj = rank(padj, ties.method = "min")) |>
+  ungroup() |>
+  mutate(dir = if_else(score > 0, "Activated in KO", "Repressed in KO"),
+         sig = padj < 0.05)
+
+share <- acts |>
+  filter(sig) |>
+  group_by(source) |>
+  summarise(DESCRIPTION  = dplyr::first(DESCRIPTION),
+            n_contrast   = n(),
+            contrasts    = paste(as.character(contrast), collapse = " | "),
+            n_up         = sum(score > 0),
+            n_down       = sum(score < 0),
+            mean_score   = mean(score),
+            best_padj    = min(padj),
+            average_rank = mean(rank_padj),
+            .groups      = "drop") |>
+  mutate(consistent = (n_up == 0 | n_down == 0)) |>
+  arrange(average_rank)
+
+print(htmltools::tagList(
+    default_dt(
+      share
+    ) |>
+      formatSignif(columns = c("best_padj"), digits = 3) |>
+      formatRound(columns = c("mean_score", "average_rank"), digits = 2)
+  ))
+```
+
+## Dotplot {.tabset}
+
+```{r results='asis'}
+library(dplyr); library(tidyr); library(tibble); library(ggplot2)
+
+tf_pattern <- function(acts,
+                       required,
+                       forbidden,
+                       sig_cut       = 0.05,
+                       forbidden_cut = 0.05,
+                       order_by      = "cluster",
+                       title,
+                       subtitle = NULL) {
+
+  padj_wide <- acts |>
+    dplyr::select(source, contrast, padj) |>
+    pivot_wider(names_from = contrast, values_from = padj)
+
+  keep <- padj_wide |>
+    filter(if_all(all_of(required),  ~ .x <  sig_cut),
+           if_all(all_of(forbidden), ~ .x >= forbidden_cut)) |>
+    pull(source)
+
+  if (length(keep) == 0) {
+    message("No TFs match this pattern: ", title)
+    return(list(tfs = character(0), table = acts[0, ], plot = NULL))
+  }
+
+  ## ---- row ordering -------------------------------------------------------
+  score_mat <- acts |>
+    filter(source %in% keep) |>
+    dplyr::select(source, contrast, score) |>
+    pivot_wider(names_from = contrast, values_from = score) |>
+    column_to_rownames("source") |> as.matrix()
+
+  tf_order <- if (identical(order_by, "cluster")) {
+    if (length(keep) >= 3) rownames(score_mat)[hclust(dist(score_mat))$order] else keep
+  } else {
+    rownames(score_mat)[order(score_mat[, order_by])]
+  }
+
+  ## ---- table (all 4 contrasts kept, so you can see the non-significant arms)
+  tbl <- acts |>
+    filter(source %in% keep) |>
+    mutate(source  = factor(source, levels = tf_order),
+           pattern = title) |>
+    arrange(desc(source), contrast) |>
+    dplyr::select(pattern, source, DESCRIPTION, contrast, score, dir,
+                  p_value, padj, rank_padj, sig)
+
+  ## ---- plot ---------------------------------------------------------------
+  p <- acts |>
+    filter(source %in% keep) |>
+    mutate(source = factor(source, levels = tf_order)) |>
+    ggplot(aes(contrast, source)) +
+    geom_point(aes(size = pmin(-log10(padj), 6), fill = score, colour = sig),
+               shape = 21, stroke = 0.4) +
+    scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426",
+                         midpoint = 0, name = "ULM score\n(+ = up in KO)") +
+    scale_colour_manual(values = c(`TRUE` = "grey15", `FALSE` = "grey80"),
+                        name = "FDR < 0.05", labels = c("no", "yes")) +
+    scale_size_continuous(range = c(1, 7), name = expression(-log[10]~FDR),
+                          breaks = c(1.3, 3, 6), labels = c("0.05", "0.001", "≤1e-6")) +
+    labs(x = NULL, y = NULL, title = title, subtitle = subtitle) +
+    guides(colour = guide_legend(override.aes = list(size = 4, fill = "white"))) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.minor = element_blank())
+
+  list(tfs = tf_order, table = tbl, plot = p)
+}
+```
+
+### AZA Tcells
+
+```{r fig.height=19, fig.width=6, results='asis'}
+## ---  combination-exclusive ----------------------------------------------
+combo_only <- tf_pattern(
+  acts,
+  required  = "AZA_Tcells",
+  forbidden = c("VEH"),
+  order_by  = "AZA_Tcells",
+  title     = "TF activity exclusive to the combined condition",
+  subtitle  = "Significant in AZA_Tcells only — candidate synergy-dependent TFs")
+
+combo_only$plot
+cat("\n\n")
+
+print(htmltools::tagList(
+    default_dt(
+      combo_only$table
+    ) |>
+      formatSignif(columns = c("p_value", "padj"), digits = 3) |>
+      formatRound(columns = c("score"), digits = 2)
+  ))
+cat("\n\n")
+```
+
+```{r}
+library(ComplexHeatmap)
+```
+
+# Top 5 TF per contrast
+
+```{r}
+## gene-level statistic, long form ----------------------------------------
+de_long <- bind_rows(res_list, .id = "contrast") |>
+  transmute(contrast = factor(contrast, levels = levels(acts$contrast)),
+            gene = SYMBOL, logFC, PValue, FDR,
+            sign_fc = -log10(PValue) * logFC)
+
+top5 <- acts |>
+  group_by(contrast) |>
+  slice_max(abs(score), n = 5, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(contrast, desc(score)) |>
+  mutate(label = paste0(contrast, " — ", source,
+                        "\nt = ", round(score, 2), ", FDR = ", signif(padj, 2)),
+         label = factor(label, levels = unique(label)))
+
+## --- diagnostic frame, with DE status of each target ----------------------
+pal <- c("Activated target (DE)"   = "#B40426",
+         "Activated target (n.s.)" = "#F0A9A0",
+         "Repressed target (DE)"   = "#3B4CC0",
+         "Repressed target (n.s.)" = "#A3B8E8")
+
+diag_df <- top5 |>
+  dplyr::select(contrast, source, label) |>
+  left_join(de_long, by = "contrast", relationship = "many-to-many") |>
+  left_join(net, by = c("source", "gene" = "target")) |>
+  mutate(mor = replace_na(mor, 0),
+         target_sig = FDR < 0.05,
+         role = case_when(
+           mor ==  0                ~ "Not a target",
+           mor ==  1 &  target_sig  ~ "Activated target (DE)",
+           mor ==  1 & !target_sig  ~ "Activated target (n.s.)",
+           mor == -1 &  target_sig  ~ "Repressed target (DE)",
+           mor == -1 & !target_sig  ~ "Repressed target (n.s.)"),
+         role = factor(role, levels = c(names(pal), "Not a target")))
+```
+
+## Top TFs gene summary
+
+###  Top 5 TFs
+
+```{r results='asis'}
+tf_support <- diag_df |>
+  filter(mor != 0) |>
+  group_by(contrast, source) |>
+  summarise(n_targets     = n(),
+            n_activating  = sum(mor == 1),
+            n_repressing  = sum(mor == -1),
+            n_target_sig  = sum(FDR < 0.05),
+            perc_target_sig = sum(FDR < 0.05)/ n(),
+            concordant    = mean(sign(sign_fc) == sign(mor)),
+            .groups = "drop") |>
+  left_join(top5 |> dplyr::select(contrast, source, score, padj, DESCRIPTION),
+            by = c("contrast", "source")) |>
+  arrange(contrast, desc(abs(score))) |>
+  relocate(DESCRIPTION, .after = source)
+
+print(htmltools::tagList(
+    default_dt(
+      tf_support
+    ) |>
+      formatSignif(columns = c("padj"), digits = 3) |>
+      formatRound(columns = c("perc_target_sig", "concordant", "score"), digits = 2)
+  ))
+```
+
+## IFN/ inflammatory response
+
+```{r}
+library(dplyr); library(writexl)
+
+table_dir <- params$table_dir
+
+## --- assemble the essential tables ----------------------------------------
+tf_tables <- list(
+  summary_per_contrast = tf_summary,
+  TF_activity_all      = acts |> arrange(contrast, padj),
+  shared_TFs           = share,
+  pattern_combo_only   = combo_only$table,
+  top5_target_support  = tf_support,
+  TF_annotation        = tf_lookup
+)
+
+tf_tables <- tf_tables[vapply(tf_tables, \(x) !is.null(x) && nrow(x) > 0, logical(1))]
+
+## --- CSV: one file per table ----------------------------------------------
+invisible(lapply(names(tf_tables), function(nm) {
+  readr::write_csv(
+    tf_tables[[nm]] |> mutate(across(where(is.factor), as.character)),
+    file.path(table_dir, paste0("TF_activity_", nm, ".csv"))
+  )
+}))
+
+## --- Excel: one workbook, one sheet per table -----------------------------
+write_xlsx(
+  lapply(tf_tables, \(x) x |> mutate(across(where(is.factor), as.character))),
+  path = file.path(table_dir, "TF_activity_decoupleR_CollecTRI.xlsx")
+)
+
+saveRDS(net, file.path(params$data_dir, "collectri_mouse_stat1Extended.rds"))
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

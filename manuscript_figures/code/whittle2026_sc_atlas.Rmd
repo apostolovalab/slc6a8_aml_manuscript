@@ -1,0 +1,509 @@
+---
+title: " Single-cell atlas (Whittle et al 2026) related figures"
+subtitle: "Creatine Manuscript"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r setup}
+params <- list(
+  seed = 12435,
+  interactive = TRUE,
+  gene_fdr_threshold = 0.05,
+  pathway_fdr_threshold = 0.05,
+  fig_dir = "../results/figures/whittle2026_sc_atlas_AML_BM/"
+)
+
+if(!dir.exists(params$fig_dir)) dir.create(params$fig_dir)
+
+if(Sys.getenv("RSTUDIO") == "1"){
+  params$subset = TRUE
+} else {
+  params$subset = FALSE
+}
+
+# Load packages ----------------------------------------------------------------
+library(BiocParallel)
+library(yaml)
+library(DT)
+library(writexl)
+library(unikn)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(RColorBrewer)
+library(tibble)
+library(tidyr)
+library(knitr)
+library(stringr)
+library(purrr)
+library(dplyr)
+library(forcats)
+library(ggpointdensity)
+library(data.table)
+library(circlize)
+library(SingleCellExperiment)
+library(zellkonverter)
+
+# Load globals -----------------------------------------------------------------
+set.seed(params$seed)
+
+msigdb_dir <- "../../references/MSigDb_2025.1/"
+
+de_table_cols <- c(
+  "ENTREZID", "GENEID", "SYMBOL", "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+round_de_table_cols <- c(
+  "logFC", "logCPM", "F", "PValue", "FDR"
+)
+
+format_pval_plain <- function(p) {
+  if (p < 0.001) {
+    exp <- floor(log10(p))
+    paste0("p < 1e", exp)
+  } else {
+    sprintf("p = %.3f", p)
+  }
+}
+```
+
+# Whittle et al. 2026
+
+```{r}
+subset_dat_file <- "../data/whittle2026_sc_atlas_AML_BM/data/AML_scAtlas_Jan2026_subset.h5ad"
+if(params$subset == TRUE & file.exists(subset_dat_file)){
+  dat <- readRDS(subset_dat_file)
+} else {
+  library(zellkonverter)
+  dat <- readH5AD(file = "../data/whittle2026_sc_atlas_AML_BM/data/AML_scAtlas_Jan2026.h5ad.gz", reader = "R")
+  # Supplement with gene symbols -------------------------------------------------
+  rowData(dat)$gene_symbol  <- rownames(dat)
+  library(org.Hs.eg.db)
+  genes <- rownames(dat)
+
+  genes_clean <- sub("\\.[0-9]+$", "", genes)
+
+  ens_vec <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys     = genes_clean,
+    keytype  = "SYMBOL",
+    column   = "ENSEMBL",
+    multiVals = "first"
+  )
+  ens_ids <- data.frame(
+    SYMBOL         = genes,
+    cleaned_symbol = genes_clean,
+    ENSEMBL        = ens_vec,
+    stringsAsFactors = FALSE
+  )
+  new_rownames <- ifelse(
+    is.na(ens_ids$ENSEMBL),
+    ens_ids$SYMBOL,
+    ens_ids$ENSEMBL
+  )
+  rownames(dat) <- new_rownames
+  dat <- dat[!duplicated(rownames(dat)), ]
+
+}
+```
+
+## Figure 7F: SLC6A8 expression
+
+```{r}
+# ==== Setup ====
+library(SingleCellExperiment)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrastr)
+library(patchwork)
+
+pal_status <- c(Healthy = "#3B7EA1", AML = "#C0392B")
+pal_expr   <- c("#FDD49E", "#FC8D59", "#D7301F", "#7F0000")
+
+pal_celltype <- c(HSPC = "#F28E2B", CMP = "#8C564B", GMP = "#FFD92F", MEP = "#E15759",
+                  Erythroid = "#FF9DA7", ProMono = "#1B7837", `CD14+ Mono` = "#7FBC41",
+                  `CD16+ Mono` = "#B8E186", cDC = "#35978F", pDC = "#80CDC1",
+                  ProB = "#C2A5CF", B = "#9970AB", Plasma = "#40004B",
+                  T = "#4E79A7", NK = "#A0CBE8", Stromal = "grey50")
+pal_cat  <- c(Erythroid = "#D95F02", Leukemic = "#7570B3", Other = "grey88")
+pal_rate <- c("#FFF7EC", "#FDD49E", "#FC8D59", "#D7301F", "#7F0000")
+
+theme_umap <- function() {
+  theme_classic(base_size = 14) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          strip.background = element_blank())
+}
+
+ery_types   <- c("earlyEry", "lateEry", "Erythroid")
+leuk_types  <- c("LSC", "HSC-like", "Prog-like", "GMP-like", "ProMono-like", "Mono-like", "cDC-like")
+other_types <- c("HSC", "Prog", "HSPC", "CMP", "MEP", "GMP", "ProMono", "CD14+ Mono", "CD16+ Mono",
+                 "cDC", "pDC", "ProB", "B", "Plasma", "T", "NK", "Stromal")
+hspc_keep   <- c("HSC", "Prog", "GMP", "earlyEry", "lateEry", leuk_types)
+
+# ==== Cell-level table ====
+build_cell_table <- function(sce, gene_symbol = "SLC6A8", umap = "X_scVI_umap") {
+  gid <- rownames(sce)[rowData(sce)$gene_symbol == gene_symbol]
+  stopifnot(length(gid) == 1)
+  um <- reducedDim(sce, umap)
+
+  out <- as.data.frame(colData(sce)) %>%
+    mutate(across(where(is.factor), ~ trimws(as.character(.x)))) %>%
+    transmute(
+      cell_id = colnames(sce),
+      Donor, Study,
+      status = factor(if_else(ELN.Risk.Group == "Healthy_Donor", "Healthy", "AML"),
+                      levels = c("Healthy", "AML")),
+      fine = case_when(
+        Cell.Type != "HSPC"           ~ Cell.Type,
+        HSPC.Cell.Type %in% hspc_keep ~ HSPC.Cell.Type,
+        TRUE                          ~ "HSPC"),
+      expr  = as.numeric(assay(sce, "X")[gid, ]),
+      UMAP1 = um[, 1],
+      UMAP2 = um[, 2]) %>%
+    mutate(
+      category = case_when(
+        fine %in% ery_types  ~ "Erythroid",
+        fine %in% leuk_types ~ "Leukemic",
+        TRUE                 ~ "Other"),
+      category = factor(category, levels = c("Erythroid", "Leukemic", "Other")),
+      fine     = factor(fine, levels = c(ery_types, leuk_types, other_types)))
+
+  stopifnot(!anyNA(out$fine))
+  out
+}
+
+cells      <- build_cell_table(dat)
+cells_main <- cells %>% filter(!(status == "Healthy" & category == "Leukemic"))
+
+# UMAP grid ====
+plot_umap_panel <- function(df_all, df_hl, st, ct, expr_lim, xr, yr) {
+  lab <- paste0(st, ": ", ct)
+  bg  <- df_all %>% filter(status == st) %>% mutate(panel = lab)
+  hl  <- df_hl  %>% filter(status == st, category == ct) %>% mutate(panel = lab)
+  hl0 <- hl %>% filter(expr == 0)
+  hl1 <- hl %>% filter(expr > 0) %>% arrange(expr)
+
+  ggplot(mapping = aes(UMAP1, UMAP2)) +
+    geom_point_rast(data = bg,  colour = "grey92", size = 0.05, raster.dpi = 600) +
+    geom_point_rast(data = hl0, colour = "grey60", size = 0.05, raster.dpi = 600) +
+    geom_point_rast(data = hl1, aes(colour = expr), size = 0.2, raster.dpi = 600) +
+    facet_wrap(~ panel) +
+    scale_colour_gradientn(colours = pal_expr, limits = expr_lim, name = "SLC6A8\nlog-norm") +
+    coord_fixed(xlim = xr, ylim = yr) +
+    theme_classic(base_size = 14) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          strip.background = element_blank(),
+          strip.text = element_text(size = 15, face = "bold"))
+}
+
+plot_umap_grid <- function(df_all, df_hl, assemble = TRUE) {
+  expr_lim <- c(0, max(df_hl$expr))
+  xr <- range(df_all$UMAP1)
+  yr <- range(df_all$UMAP2)
+  grid <- expand_grid(st = levels(df_all$status), ct = levels(df_all$category))
+
+  panels <- map2(grid$st, grid$ct, function(st, ct) {
+    if (!any(df_hl$status == st & df_hl$category == ct)) return(plot_spacer())
+    plot_umap_panel(df_all, df_hl, st, ct, expr_lim, xr, yr)
+  })
+  if (!assemble) return(panels)
+  wrap_plots(panels, nrow = 2, guides = "collect")
+}
+
+# ---- Cell-type reference UMAP ----
+plot_umap_celltype <- function(df, label = FALSE) {
+  set.seed(1)
+  p <- ggplot(slice_sample(df, prop = 1), aes(UMAP1, UMAP2, colour = Cell.Type)) +
+    geom_point_rast(size = 0.05, raster.dpi = 600) +
+    scale_colour_manual(values = pal_celltype, name = NULL) +
+    guides(colour = guide_legend(override.aes = list(size = 3), ncol = 2)) +
+    coord_fixed() +
+    theme_umap()
+  if (label) {
+    cent <- df %>% group_by(Cell.Type) %>%
+      summarise(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2), .groups = "drop")
+    p <- p + geom_text(data = cent, aes(label = Cell.Type), colour = "black",
+                       size = 3.5, fontface = "bold") +
+      theme(legend.position = "none")
+  }
+  p
+}
+
+# ---- Reference panel: where the categories sit ----
+plot_umap_category <- function(df) {
+  df %>%
+    mutate(category = if_else(status == "Healthy" & category == "Leukemic",
+                              "Other", as.character(category)),
+           category = factor(category, levels = c("Other", "Erythroid", "Leukemic"))) %>%
+    arrange(category) %>%
+    ggplot(aes(UMAP1, UMAP2, colour = category)) +
+    geom_point_rast(size = 0.05, raster.dpi = 600) +
+    scale_colour_manual(values = pal_cat, breaks = c("Erythroid", "Leukemic", "Other"),
+                        name = NULL) +
+    guides(colour = guide_legend(override.aes = list(size = 3))) +
+    coord_fixed() +
+    theme_classic(base_size = 14) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank())
+}
+```
+
+### UMAP
+
+```{r fig.width=8.7, fig.height=8.7}
+stopifnot(identical(colnames(dat), cells$cell_id))
+cells$Cell.Type <- trimws(as.character(dat$Cell.Type))
+
+# ==== Fig 1: legends placed in the two empty slots ====
+library(cowplot)
+
+leg_theme <- theme(legend.text = element_text(size = 11),
+                   legend.title = element_text(size = 12),
+                   legend.key.size = unit(0.45, "cm"))
+no_leg    <- function(p) p + theme(legend.position = "none")
+
+# ---- Plots (with legend titles) ----
+p_ct  <- plot_umap_celltype(cells) +
+  guides(colour = guide_legend(title = "Cell type", override.aes = list(size = 3), ncol = 2)) +
+  leg_theme + ggtitle("Cell type")
+p_cat <- plot_umap_category(cells) +
+  guides(colour = guide_legend(title = "Category", override.aes = list(size = 3))) +
+  leg_theme  + ggtitle("Category")
+panels <- plot_umap_grid(cells, cells_main, assemble = FALSE)
+
+# ---- Extract legends ----
+leg_ct   <- get_legend(p_ct)
+leg_cat  <- get_legend(p_cat)
+leg_expr <- get_legend(panels[[1]] + leg_theme)
+
+leg_top <- wrap_elements(full = leg_ct) / wrap_elements(full = leg_cat) +
+  plot_layout(heights = c(2, 1))
+leg_mid <- wrap_elements(full = leg_expr)
+
+# ---- Assemble 3 x 3 ----
+p_fig1 <- wrap_plots(
+  no_leg(p_ct),         no_leg(p_cat),       leg_top,
+  no_leg(panels[[1]]),  leg_mid,             no_leg(panels[[3]]),
+  no_leg(panels[[4]]),  no_leg(panels[[5]]), no_leg(panels[[6]]),
+  ncol = 3)
+
+## Plot and save =====================================================================
+p_fig1
+
+ggsave(file.path(params$fig_dir, "scatlas_SLC6A8_umap.pdf"),   p_fig1,
+       width = 8.7, height = 8.7)
+```
+
+```{r}
+pct_if_enough <- function(z, min_cells = 20) {
+  if (length(z) < min_cells) NA_real_ else 100 * mean(z)
+}
+
+# ---- Detection-rate map, split by donor group ----
+plot_umap_detection <- function(df, bins = 80, min_cells = 20) {
+  ggplot(df, aes(UMAP1, UMAP2, z = as.numeric(expr > 0))) +
+    stat_summary_hex(fun = pct_if_enough, fun.args = list(min_cells = min_cells), bins = bins) +
+    facet_wrap(~ status) +
+    scale_fill_gradientn(colours = pal_rate, na.value = "grey92",
+                         name = "% SLC6A8+\ncells") +
+    coord_fixed() +
+    theme_classic(base_size = 14) +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          strip.background = element_blank())
+}
+
+p_umap2 <- plot_umap_category(cells) + plot_umap_detection(cells, bins = 30, min_cells = 20) +
+  plot_layout(widths = c(1, 2))
+
+p_umap2
+```
+
+```{r}
+# ==== Fig (extended): shared helpers ====
+stopifnot(identical(colnames(dat), cells$cell_id))
+cells$Cell.Type <- trimws(as.character(dat$Cell.Type))
+
+xr <- range(cells$UMAP1)
+yr <- range(cells$UMAP2)
+bw <- rep(diff(xr) / 80, 2)
+
+# ---- Detection rate by donor group (replaces previous version) ----
+plot_umap_detection <- function(df, bw, xr, yr, min_cells = 20) {
+  ggplot(df, aes(UMAP1, UMAP2)) +
+    geom_hex(binwidth = bw, fill = "grey92") +
+    stat_summary_hex(aes(z = as.numeric(expr > 0)), fun = pct_if_enough,
+                     fun.args = list(min_cells = min_cells), binwidth = bw) +
+    facet_wrap(~ status) +
+    coord_fixed(xlim = xr, ylim = yr) +
+    theme_umap()
+}
+
+# ---- One grid panel: category cells within one donor group ----
+plot_hex_panel <- function(df_all, df_hl, st, ct, bw, xr, yr, min_cells = 20) {
+  lab <- paste0(st, ": ", ct)
+  bg  <- df_all %>% filter(status == st) %>% mutate(panel = lab)
+  hl  <- df_hl  %>% filter(status == st, category == ct) %>% mutate(panel = lab)
+
+  ggplot(mapping = aes(UMAP1, UMAP2)) +
+    geom_hex(data = bg, binwidth = bw, fill = "grey92") +
+    stat_summary_hex(data = hl, aes(z = as.numeric(expr > 0)), fun = pct_if_enough,
+                     fun.args = list(min_cells = min_cells), binwidth = bw, bins = 30) +
+    facet_wrap(~ panel) +
+    coord_fixed(xlim = xr, ylim = yr) +
+    theme_umap()
+}
+
+# ---- 2 x 3 grid (Healthy x Leukemic left empty) ----
+plot_hex_grid <- function(df_all, df_hl, bw, xr, yr, min_cells = 20) {
+  grid <- expand_grid(st = levels(df_all$status), ct = levels(df_all$category))
+  map2(grid$st, grid$ct, function(st, ct) {
+    if (!any(df_hl$status == st & df_hl$category == ct)) return(plot_spacer())
+    plot_hex_panel(df_all, df_hl, st, ct, bw, xr, yr, min_cells)
+  })
+}
+
+# ---- Shared colour scale across all hex panels ----
+has_layers <- function(p) length(p$layers) > 0
+
+hex_max <- function(p) {
+  if (!has_layers(p)) return(NA_real_)
+  max(layer_data(p, length(p$layers))$value, na.rm = TRUE)
+}
+
+add_rate_scale <- function(p, lim) {
+  if (!has_layers(p)) return(p)
+  p + scale_fill_gradientn(colours = pal_rate, limits = lim, na.value = NA,
+                           name = "% SLC6A8+\ncells")
+}
+
+# ==== Assemble ====
+p_det  <- plot_umap_detection(cells, bw, xr, yr)
+p_grid <- plot_hex_grid(cells, cells_main, bw, xr, yr)
+
+lim    <- c(0, max(map_dbl(c(list(p_det), p_grid), hex_max), na.rm = TRUE))
+p_det  <- add_rate_scale(p_det, lim)
+p_grid <- map(p_grid, add_rate_scale, lim = lim)
+
+top    <- plot_umap_celltype(cells) + plot_umap_category(cells) + p_det +
+  plot_layout(widths = c(1, 1, 2))
+bottom <- wrap_plots(p_grid, nrow = 2)
+p_fig1 <- (top / bottom) + plot_layout(heights = c(1, 2), guides = "collect")
+```
+
+### Violin plot
+
+```{r}
+plot_violin_strip <- function(df) {
+  nz <- df %>% filter(expr > 0)
+  sm <- df %>%
+    group_by(category, status) %>%
+    summarise(n = n(), n_expr = sum(expr > 0), pct = 100 * n_expr / n, .groups = "drop")
+
+  p_v <- ggplot(nz, aes(status, expr, fill = status)) +
+    geom_violin(scale = "width", alpha = 0.8, colour = NA) +
+    geom_jitter_rast(width = 0.15, size = 0.3, alpha = 0.3, raster.dpi = 600) +
+    stat_summary(fun = median, geom = "crossbar", width = 0.5, linewidth = 0.3) +
+    facet_grid(~ category, scales = "free_x", space = "free_x") +
+    scale_fill_manual(values = pal_status, guide = "none") +
+    labs(x = NULL, y = "SLC6A8 log-norm\n(expressing cells)") +
+    theme_classic(base_size = 16) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+          strip.background = element_blank(),
+          strip.text = element_text(size = 15, face = "bold"))
+
+  p_s <- ggplot(sm, aes(status, pct, fill = status)) +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = sprintf("%.2f%%\n(%d/%d)", pct, n_expr, n)), vjust = -0.2, size = 4) +
+    facet_grid(~ category, scales = "free_x", space = "free_x") +
+    scale_fill_manual(values = pal_status, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.6))) +
+    labs(x = NULL, y = "% expr.") +
+    theme_classic(base_size = 16) +
+    theme(strip.text = element_blank(), strip.background = element_blank())
+
+  p_v / p_s + plot_layout(heights = c(3, 1.6))
+}
+```
+
+```{r fig.width=5.7, fig.height=4.4}
+p_vio  <- plot_violin_strip(cells_main)
+
+p_vio
+ggsave(file.path(params$fig_dir, "scatlas_SLC6A8_violin.pdf"), p_vio, width = 5.7, height = 4.4)
+```
+
+### Dotplot
+
+```{r}
+summarise_dot <- function(df, mean_mode = c("all", "nonzero"), min_cells = 50, min_donors = 3) {
+  mean_mode <- match.arg(mean_mode)
+  df %>%
+    group_by(category, fine, status) %>%
+    summarise(
+      n         = n(),
+      n_donors  = n_distinct(Donor),
+      pct       = 100 * mean(expr > 0),
+      mean_expr = if (mean_mode == "all") log1p(mean(expm1(expr)))
+                  else log1p(mean(expm1(expr[expr > 0]))),
+      .groups = "drop") %>%
+    mutate(pass = n >= min_cells & n_donors >= min_donors,
+           fine = factor(fine, levels = rev(levels(fine))))
+}
+
+plot_dot <- function(dd) {
+  ggplot(dd, aes(status, fine)) +
+    geom_point(data = filter(dd, pass, pct == 0), shape = 1, size = 1, colour = "grey60") +
+    geom_point(data = filter(dd, pass, pct > 0), aes(size = pct, colour = mean_expr)) +
+    geom_blank() +
+    facet_grid(category ~ ., scales = "free_y", space = "free_y") +
+    scale_size_area(max_size = 8, breaks = c(0.1, 1, 5, 15), name = "% expressing") +
+    scale_colour_gradientn(colours = pal_expr, name = "Mean\nlog-norm") +
+    labs(x = NULL, y = NULL) +
+    theme_bw(base_size = 14) +
+    theme(panel.grid.minor = element_blank(),
+          strip.text.y = element_text(angle = 0),
+          strip.background = element_blank())
+}
+```
+
+```{r fig.width=5, fig.height=4.3}
+dd     <- summarise_dot(cells, mean_mode = "all")
+p_dot  <- plot_dot(dd)
+p_dot
+
+ggsave(file.path(params$fig_dir, "scatlas_SLC6A8_dotplot.pdf"), p_dot, width = 5, height = 4.3)
+```
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
+

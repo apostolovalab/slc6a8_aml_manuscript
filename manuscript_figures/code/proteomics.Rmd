@@ -1,0 +1,258 @@
+---
+title: "Manuscript figures — Proteomics RMB1"
+subtitle: "Creatine Manuscript"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: "Anthony Sonrel"
+output:
+  rmdformats::readthedown:
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_download: true
+    code_folding: hide
+papersize: a4
+geometry: margin=0.5in
+---
+
+```{r options, include=FALSE}
+options(bitmapType = "cairo")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  collapse = FALSE,
+  comment = NA,
+  prompt = FALSE,
+  tidy = FALSE,
+  dev = "png",
+  out.width = "100%"
+)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+```
+
+# Inputs
+
+```{r}
+file_samples <- "../data/proteom_rmb1_slc6a8_ko_aza_tcell/data/proteomics_sample_list.xlsx"
+file_prot    <- "../data/proteom_rmb1_slc6a8_ko_aza_tcell/data/proteoflux_table.xlsx"
+out_dir      <- "../results/figures/proteomics"
+dir.create(out_dir, showWarnings = FALSE)
+
+```
+
+# Sample sheet
+
+```{r}
+grp_map <- tibble(
+  Group       = 1:4,
+  pf_group    = c("A", "B", "C", "D"),
+  group_key   = c("CTRL_VEH", "KO_VEH", "CTRL_AZA_Tcells", "KO_AZA_Tcells"),
+  group_label = c("CTRL,Vehicle", "KO,Vehicle", "CTRL,AZA+Tcells", "KO,AZA+Tcells")
+)
+
+samp <- read_excel(file_samples) %>%
+  rename(vial = `Number on vial`, cell_type = `cell type`) %>%
+  mutate(
+    vial        = as.integer(vial),
+    Group       = as.integer(Group),
+    Description = trimws(Description),
+    sample_id   = sprintf("%03d_TG002FT_J26", vial)
+  ) %>%
+  left_join(grp_map, by = "Group")
+
+samp %>% count(Group, pf_group, Description, group_label)
+```
+
+# Proteomics (ProteoFlux 'Summary' sheet)
+
+```{r}
+prot <- read_excel(file_prot, sheet = "Summary", guess_max = 10000)
+
+int_cols <- paste0("Processed_log2_Intensities", samp$sample_id)
+raw_cols <- paste0("Raw_Intensities", samp$sample_id)
+
+stopifnot(all(int_cols %in% colnames(prot)), all(raw_cols %in% colnames(prot)))
+dim(prot)
+```
+
+# Heatmap — AZA + T cells (CTRL vs KO)
+
+## Genes and samples
+
+```{r}
+genes_hm <- c("Cybb", "Cd40", "Cd80", "Cd86", "S100a9", "H2-DMa", "H2-DMb1", "H2-Aa", "H2-Ab1", "H2-Ea", "Cd74")
+
+prot_map <- prot %>%
+  select(UNIPROT_AC, GENE_NAMES, NUM_PRECURSORS, NUM_UNIQUE_PEPTIDES) %>%
+  mutate(gene = GENE_NAMES) %>%
+  separate_rows(gene, sep = ";") %>%
+  filter(gene %in% genes_hm) %>%
+  group_by(gene) %>%
+  slice_max(NUM_PRECURSORS, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+missing_genes <- setdiff(genes_hm, prot_map$gene)
+if (length(missing_genes) > 0)
+  message("Not found in data (dropped): ", paste(missing_genes, collapse = ", "))
+
+prot_map <- prot_map %>% slice(match(intersect(genes_hm, gene), gene))
+prot_map
+
+grp_levels_hm <- c("CTRL,AZA+Tcells", "KO,AZA+Tcells")
+
+samp_ord <- samp %>%
+  filter(group_label %in% grp_levels_hm) %>%
+  mutate(group_label = factor(group_label, levels = grp_levels_hm)) %>%
+  arrange(group_label, vial)
+```
+
+## Matrices and stats
+
+```{r}
+prot_sel <- prot %>% slice(match(prot_map$UNIPROT_AC, UNIPROT_AC))
+
+mat <- prot_sel %>%
+  select(all_of(paste0("Processed_log2_Intensities", samp_ord$sample_id))) %>%
+  as.matrix()
+dimnames(mat) <- list(prot_map$gene, samp_ord$sample_id)
+
+imp_mat <- prot_sel %>%
+  select(all_of(paste0("Raw_Intensities", samp_ord$sample_id))) %>%
+  as.matrix() %>%
+  is.na()
+dimnames(imp_mat) <- dimnames(mat)
+
+keep    <- apply(mat, 1, sd) > 0
+mat     <- mat[keep, , drop = FALSE]
+imp_mat <- imp_mat[keep, , drop = FALSE]
+mat_z   <- t(scale(t(mat)))
+
+st_aza <- prot_sel %>%
+  transmute(gene  = prot_map$gene,
+            logFC = -log2FC_C_vs_D,
+            FDR   = QVALUE_C_vs_D,
+            n_obs_CTRL = Observed_C,
+            n_obs_KO   = Observed_D) %>%
+  slice(match(rownames(mat_z), gene))
+
+st_aza
+```
+
+## Plot
+
+```{r, fig.width = 5.5, fig.height = 4.6}
+mark_imputed <- TRUE
+show_ns      <- TRUE
+
+sig_lab <- function(p) {
+  ifelse(is.na(p), "",
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01,  "**",
+  ifelse(p < 0.05,   "*", if (show_ns) "ns" else ""))))
+}
+
+grp_cols <- c("CTRL,AZA+Tcells" = "#FCBBA1", "KO,AZA+Tcells" = "#CB181D")
+
+z_lim   <- max(abs(mat_z), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#B2182B"))
+
+m            <- max(abs(st_aza$logFC), na.rm = TRUE)
+col_fun_stat <- colorRamp2(c(-m, 0, m), c("#2166AC", "white", "#D6604D"))
+
+top_anno <- HeatmapAnnotation(
+  Group = samp_ord$group_label,
+  col   = list(Group = grp_cols),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Group = list(title = "Group",
+                 title_gp  = gpar(fontsize = 13, fontface = "bold"),
+                 labels_gp = gpar(fontsize = 12))
+  )
+)
+
+row_anno <- rowAnnotation(
+  `AZA+Tc` = anno_simple(st_aza$logFC, col = col_fun_stat,
+                         pch = sig_lab(st_aza$FDR),
+                         pt_gp = gpar(fontsize = 12, fontface = "bold"),
+                         na_col = "grey90", width = unit(8, "mm")),
+  show_annotation_name = FALSE
+)
+
+stat_legend <- Legend(
+  col_fun   = col_fun_stat,
+  title     = "log2FC\n(KO vs CTRL)",
+  direction = "vertical",
+  title_gp  = gpar(fontsize = 13, fontface = "bold"),
+  labels_gp = gpar(fontsize = 12)
+)
+
+imp_legend <- Legend(
+  labels    = "Not detected\n(imputed)",
+  type      = "points", pch = 4,
+  legend_gp = gpar(col = "grey30"),
+  background = "white",
+  title     = NULL,
+  labels_gp = gpar(fontsize = 12)
+)
+
+lgd_list <- if (mark_imputed && any(imp_mat)) list(stat_legend, imp_legend) else list(stat_legend)
+
+ht <- Heatmap(
+  mat_z,
+  name                = "Row z-score\n(log2 intensity)",
+  col                 = col_fun,
+  top_annotation      = top_anno,
+  right_annotation    = row_anno,
+  cluster_rows        = FALSE,
+  cluster_columns     = FALSE,
+  column_split        = samp_ord$group_label,
+  column_title        = NULL,
+  show_column_names   = FALSE,
+  row_names_side      = "left",
+  row_names_gp        = gpar(fontsize = 13, fontface = "italic"),
+  column_gap          = unit(1.5, "mm"),
+  border              = TRUE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (mark_imputed && imp_mat[i, j])
+      grid.points(x, y, pch = 4, size = unit(2, "mm"), gp = gpar(col = "grey30", lwd = 1))
+  },
+  heatmap_legend_param = list(
+    title_gp  = gpar(fontsize = 13, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+
+draw_ht <- function() {
+  draw(ht, merge_legend = TRUE,
+       heatmap_legend_side    = "right",
+       annotation_legend_side = "right",
+       annotation_legend_list = lgd_list,
+       padding = unit(c(2, 2, 2, 2), "mm"),
+       ht_gap  = unit(8, "mm"))
+}
+
+draw_ht()
+```
+
+## Save + log
+
+```{r}
+file_hm_prot <- "heatmap_proteomics_costim_MHCII_AZA_Tcells.pdf"
+pdf(file.path(out_dir, file_hm_prot), width = 5.5, height = 4.6)
+draw_ht()
+dev.off()
+```
+
+```{r}
+sessionInfo()
+```
+
